@@ -1,0 +1,106 @@
+{
+  "name": "antiloop",
+  "displayName": "AntiLoop",
+  "description": "Zero-restart Google account rotation, intelligent quota management, robust upstream proxying, and multi-provider AI model support for Antigravity IDE.",
+  "version": "1.0.0",
+  "publisher": "Osamu-GWAD",
+  "license": "MIT",
+  "icon": "resources/icon.png",
+  "homepage": "https://github.com/Osamu-GWAD/AntiLoop",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Osamu-GWAD/AntiLoop"
+  },
+  "bugs": {
+    "url": "https://github.com/Osamu-GWAD/AntiLoop/issues"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "antigravity",
+    "google",
+    "account",
+    "token",
+    "multi-account",
+    "rotation",
+    "proxy",
+    "manager"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onWebviewPanel:antiLoopAdmin"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "antiLoop",
+          "title": "AntiLoop",
+          "icon": "resources/loop-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "antiLoop": [
+        {
+          "id": "antiLoop.accounts",
+          "name": "Accounts",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "antiLoop.openPanel",
+        "title": "AntiLoop: Open Panel"
+      },
+      {
+        "command": "antiLoop.enable",
+        "title": "AntiLoop: Enable"
+      },
+      {
+        "command": "antiLoop.disable",
+        "title": "AntiLoop: Disable"
+      },
+      {
+        "command": "antiLoop.addAccount",
+        "title": "AntiLoop: Add Account"
+      },
+      {
+        "command": "antiLoop.testLoginCommands",
+        "title": "AntiLoop: Test Diagnostics"
+      }
+    ],
+    "menus": {},
+    "configuration": {
+      "title": "AntiLoop",
+      "properties": {
+        "jetski.cloudCodeUrl": {
+          "type": "string",
+          "description": "Override jetski API endpoint url to proxy local requests."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:uninstall": "node ./out/uninstall.js",
+    "build:go": "bash scripts/build-go.sh",
+    "typecheck": "tsc --noEmit --skipLibCheck",
+    "compile": "tsc -p ./",
+    "compile:prod": "node esbuild.js --production",
+    "build": "npm run build:go && npm run compile:prod",
+    "watch": "node esbuild.js --watch",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.27.3",
+    "typescript": "^5.3.0"
+  }
+}

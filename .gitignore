@@ -1,0 +1,9 @@
+node_modules/
+out/
+dist/
+*.vsix
+.DS_Store
+*.log
+go-core/bin/*
+!go-core/bin/antiloop-*
+!go-core/bin/antiloop-*.exe

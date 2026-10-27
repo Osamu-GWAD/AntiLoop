@@ -1,0 +1,14 @@
+.vscode/**
+.vscode-test/**
+node_modules/**
+src/**
+.git/**
+.gitignore
+*.map
+vsc-extension-quickstart.md
+scripts/**
+go-core/cmd/**
+go-core/internal/**
+go-core/go.mod
+go-core/go.sum
+Makefile
