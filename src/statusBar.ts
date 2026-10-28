@@ -40,6 +40,18 @@ export class StatusBarManager {
   private cachedQuotaEmail = '';
   private quotaSettings = { display: true, claude: true, flash: true, pro: true };
 
+  public showQuotaBar() {
+    if (this.quotaSettings.display) {
+      this.quotaBarItem.show();
+    } else {
+      this.quotaBarItem.hide();
+    }
+  }
+
+  public hasCachedQuota(): boolean {
+    return !!this.cachedQuota;
+  }
+
   public setQuotaSettings(settings?: {
     display?: boolean;
     claude?: boolean;
@@ -124,7 +136,7 @@ export class StatusBarManager {
         if (!this.quotaBarItem.text) {
           this.quotaBarItem.text = '$(loading~spin) ...';
           this.quotaBarItem.tooltip = 'Loading quota...';
-          this.quotaBarItem.show();
+          this.showQuotaBar();
         }
         break;
 
@@ -154,7 +166,7 @@ export class StatusBarManager {
     this.statusBarItem.backgroundColor = undefined;
     this.quotaBarItem.text = '$(loading~spin) Loading quota...';
     this.quotaBarItem.tooltip = 'Waiting for backend to push quota data';
-    this.quotaBarItem.show();
+    this.showQuotaBar();
   }
 
   public showProgress(msg: string) {
@@ -173,7 +185,7 @@ export class StatusBarManager {
   public showQuotaLoading() {
     this.quotaBarItem.text = '$(loading~spin) Quota...';
     this.quotaBarItem.tooltip = 'Fetching quota in background...';
-    this.quotaBarItem.show();
+    this.showQuotaBar();
   }
 
   public hideQuota() {
@@ -194,7 +206,7 @@ export class StatusBarManager {
       if (quota?.isUnlimited) {
         this.quotaBarItem.text = '$(infinity) Unlimited';
         this.quotaBarItem.tooltip = 'Enterprise / Unlimited Quota';
-        this.quotaBarItem.show();
+        this.showQuotaBar();
         return;
       }
       this.hideQuota();
@@ -202,7 +214,7 @@ export class StatusBarManager {
     }
 
     const visibleFamilies = quota.families.filter((f) => {
-      const fam = (f.family || f.label || '').toLowerCase();
+      const fam = (f.name || f.family || f.label || '').toLowerCase();
       if (fam.includes('claude')) return this.quotaSettings.claude;
       if (fam.includes('flash')) return this.quotaSettings.flash;
       if (fam.includes('pro')) return this.quotaSettings.pro;
@@ -236,7 +248,7 @@ export class StatusBarManager {
     md.appendMarkdown(`\n*Click to refresh quota across all accounts.*`);
 
     this.quotaBarItem.tooltip = md;
-    this.quotaBarItem.show();
+    this.showQuotaBar();
   }
 
   public handleProxyRetry(event: { attempt: number; maxRetries: number; delayMs?: number }) {
@@ -260,7 +272,7 @@ export class StatusBarManager {
     if (name) {
       this.quotaBarItem.text = `$(plug) External`;
       this.quotaBarItem.tooltip = `Routing via external provider: ${name} (${modelId || 'default'})`;
-      this.quotaBarItem.show();
+      this.showQuotaBar();
     } else if (this.cachedQuota) {
       this.handleQuotaUpdate(this.cachedQuota, this.cachedQuotaEmail);
     } else {

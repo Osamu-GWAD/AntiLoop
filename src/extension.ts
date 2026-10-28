@@ -101,6 +101,19 @@ export async function activate(context: vscode.ExtensionContext) {
       }
       if (action === 'setQuotaSettings') {
         statusBar?.setQuotaSettings(params);
+        if (!statusBar?.hasCachedQuota()) {
+          daemonClient
+            ?.send('listAccountsWithQuota', {})
+            .then((data: any) => {
+              const acc =
+                data?.accounts?.find((a: any) => a.email === state.currentEmail) ||
+                data?.accounts?.[0];
+              if (acc?.quota) {
+                statusBar?.handleQuotaUpdate(acc.quota, acc.email);
+              }
+            })
+            .catch(() => {});
+        }
       }
     },
     async (method, params) => {
@@ -274,7 +287,27 @@ export async function activate(context: vscode.ExtensionContext) {
       }
     }),
     vscode.commands.registerCommand('antiLoop.refreshAll', async () => {
-      accountsProvider?.refreshState();
+      statusBar?.showQuotaLoading();
+      try {
+        const data = await daemonClient?.send('listAccountsWithQuota', {});
+        if (data?.accounts) {
+          for (const a of data.accounts) {
+            if (a.status !== 'excluded') {
+              await daemonClient?.send('refreshAccount', { id: a.id, source: 'local' }).catch(() => {});
+            }
+          }
+          const updated = await daemonClient?.send('listAccountsWithQuota', {});
+          const acc =
+            updated?.accounts?.find((a: any) => a.email === state.currentEmail) ||
+            updated?.accounts?.[0];
+          if (acc?.quota) {
+            statusBar?.handleQuotaUpdate(acc.quota, acc.email);
+          }
+        }
+        accountsProvider?.refreshState();
+      } catch (err: any) {
+        log(`refreshAll error: ${err.message}`);
+      }
     }),
     vscode.commands.registerCommand('antiLoop.testLoginCommands', async () => {
       try {
