@@ -119,9 +119,12 @@ func (s *Server) SetOnRetry(fn func(attempt, maxRetries int, delayMs int)) {
 }
 
 func (s *Server) Start() error {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", "127.0.0.1:18888")
 	if err != nil {
-		return fmt.Errorf("proxy listen error: %w", err)
+		l, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return fmt.Errorf("proxy listen error: %w", err)
+		}
 	}
 	s.listener = l
 	s.port = l.Addr().(*net.TCPAddr).Port
