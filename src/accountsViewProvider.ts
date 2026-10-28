@@ -70,6 +70,9 @@ export const MUTATION_METHODS = new Set([
   'removeProvider',
   'toggleProviderEnabled',
   'selectProvider',
+  'setNetworkEnhance',
+  'setNetworkMode',
+  'setMaxRetries',
 ]);
 
 export class AccountsViewProvider implements vscode.WebviewViewProvider {
@@ -148,6 +151,7 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
         if (msg.method === 'enable' || msg.method === 'disable') {
           const res = await this.onToggleEnable(msg.method);
           webviewView.webview.postMessage({ type: 'response', id: msg.id, result: res });
+          this.refreshState();
           return;
         }
 
@@ -204,6 +208,9 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
           proxyPort: status?.proxyPort,
           networkMode: status?.networkMode,
           networkEnhance: status?.networkEnhance,
+          maxRetries: status?.maxRetries,
+          activeFamily: status?.activeFamily,
+          quotaSettings: status?.quotaSettings,
           quotaThreshold: status?.quotaThreshold,
           accounts: accountsData?.accounts || [],
           providers: providersData?.providers || [],

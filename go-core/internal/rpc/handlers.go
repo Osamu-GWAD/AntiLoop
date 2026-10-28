@@ -1,8 +1,11 @@
 package rpc
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"io"
 	"strconv"
 	"sync"
 	"time"
@@ -89,15 +92,27 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 		}
 		type AccountWithQuota struct {
 			*storage.Account
-			Quota *rotation.QuotaData `json:"quota,omitempty"`
+			Quota  *rotation.QuotaData   `json:"quota,omitempty"`
+			Models []rotation.ModelItem `json:"models,omitempty"`
 		}
 		var result []AccountWithQuota
 		for _, a := range accs {
 			awq := AccountWithQuota{Account: a}
 			if a.ModelsJSON != "" {
+				raw := []byte(a.ModelsJSON)
+				if len(raw) >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+					if gzReader, err := gzip.NewReader(bytes.NewReader(raw)); err == nil {
+						if unc, err := io.ReadAll(gzReader); err == nil {
+							raw = unc
+						}
+						gzReader.Close()
+					}
+				}
 				var data map[string]any
-				if err := json.Unmarshal([]byte(a.ModelsJSON), &data); err == nil {
-					awq.Quota = rotation.ParseQuota(data)
+				if err := json.Unmarshal(raw, &data); err == nil {
+					q := rotation.ParseQuota(data)
+					awq.Quota = q
+					awq.Models = q.Models
 				}
 			}
 			result = append(result, awq)
@@ -138,6 +153,11 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 		retriesStr := ctx.DB.GetSettingDefault("max_retries", "3")
 		retries, _ := strconv.Atoi(retriesStr)
 
+		quotaDisplay := ctx.DB.GetSettingDefault("quota_display", "true") == "true"
+		quotaClaude := ctx.DB.GetSettingDefault("quota_show_claude", "true") == "true"
+		quotaFlash := ctx.DB.GetSettingDefault("quota_show_flash", "true") == "true"
+		quotaPro := ctx.DB.GetSettingDefault("quota_show_pro", "true") == "true"
+
 		return map[string]any{
 			"enabled":        ctx.Rotation.IsEnabled(),
 			"currentEmail":   ctx.Rotation.CurrentEmail(),
@@ -149,6 +169,13 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 			"networkMode":    netMode,
 			"networkEnhance": ctx.DB.GetSettingDefault("network_enhance", "true") == "true",
 			"maxRetries":     retries,
+			"activeFamily":   ctx.DB.GetSettingDefault("active_model_family", "claude"),
+			"quotaSettings": map[string]any{
+				"display": quotaDisplay,
+				"claude":  quotaClaude,
+				"flash":   quotaFlash,
+				"pro":     quotaPro,
+			},
 		}, nil
 	})
 
@@ -162,25 +189,39 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 			Family string `json:"family"`
 		}
 		_ = json.Unmarshal(params, &p)
-		_ = ctx.DB.SetSetting("active_model_family", p.Family)
-		return map[string]bool{"ok": true}, nil
+		if p.Family != "" {
+			_ = ctx.DB.SetSetting("active_model_family", p.Family)
+		}
+		return map[string]any{"ok": true, "family": p.Family}, nil
 	})
 
 	reg.RegisterHandler("getQuotaSettings", func(params json.RawMessage) (any, error) {
 		threshold, _ := strconv.Atoi(ctx.DB.GetSettingDefault("quota_threshold", "10"))
+		display := ctx.DB.GetSettingDefault("quota_display", "true") == "true"
+		claude := ctx.DB.GetSettingDefault("quota_show_claude", "true") == "true"
+		pro := ctx.DB.GetSettingDefault("quota_show_pro", "true") == "true"
+		flash := ctx.DB.GetSettingDefault("quota_show_flash", "true") == "true"
 		return map[string]any{
 			"threshold":  threshold,
-			"showClaude": ctx.DB.GetSettingDefault("quota_show_claude", "true") == "true",
-			"showPro":    ctx.DB.GetSettingDefault("quota_show_pro", "true") == "true",
-			"showFlash":  ctx.DB.GetSettingDefault("quota_show_flash", "true") == "true",
+			"display":    display,
+			"claude":     claude,
+			"pro":        pro,
+			"flash":      flash,
+			"showClaude": claude,
+			"showPro":    pro,
+			"showFlash":  flash,
 		}, nil
 	})
 
 	reg.RegisterMutation("setQuotaSettings", func(params json.RawMessage) (any, error) {
 		var p struct {
 			Threshold  *int  `json:"threshold"`
+			Display    *bool `json:"display"`
+			Claude     *bool `json:"claude"`
 			ShowClaude *bool `json:"showClaude"`
+			Pro        *bool `json:"pro"`
 			ShowPro    *bool `json:"showPro"`
+			Flash      *bool `json:"flash"`
 			ShowFlash  *bool `json:"showFlash"`
 		}
 		_ = json.Unmarshal(params, &p)
@@ -188,16 +229,40 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 		if p.Threshold != nil {
 			_ = ctx.DB.SetSetting("quota_threshold", strconv.Itoa(*p.Threshold))
 		}
-		if p.ShowClaude != nil {
+		if p.Display != nil {
+			_ = ctx.DB.SetSetting("quota_display", strconv.FormatBool(*p.Display))
+		}
+		if p.Claude != nil {
+			_ = ctx.DB.SetSetting("quota_show_claude", strconv.FormatBool(*p.Claude))
+		} else if p.ShowClaude != nil {
 			_ = ctx.DB.SetSetting("quota_show_claude", strconv.FormatBool(*p.ShowClaude))
 		}
-		if p.ShowPro != nil {
+		if p.Pro != nil {
+			_ = ctx.DB.SetSetting("quota_show_pro", strconv.FormatBool(*p.Pro))
+		} else if p.ShowPro != nil {
 			_ = ctx.DB.SetSetting("quota_show_pro", strconv.FormatBool(*p.ShowPro))
 		}
-		if p.ShowFlash != nil {
+		if p.Flash != nil {
+			_ = ctx.DB.SetSetting("quota_show_flash", strconv.FormatBool(*p.Flash))
+		} else if p.ShowFlash != nil {
 			_ = ctx.DB.SetSetting("quota_show_flash", strconv.FormatBool(*p.ShowFlash))
 		}
-		return map[string]bool{"ok": true}, nil
+
+		display := ctx.DB.GetSettingDefault("quota_display", "true") == "true"
+		claude := ctx.DB.GetSettingDefault("quota_show_claude", "true") == "true"
+		pro := ctx.DB.GetSettingDefault("quota_show_pro", "true") == "true"
+		flash := ctx.DB.GetSettingDefault("quota_show_flash", "true") == "true"
+
+		return map[string]any{
+			"ok":         true,
+			"display":    display,
+			"claude":     claude,
+			"pro":        pro,
+			"flash":      flash,
+			"showClaude": claude,
+			"showPro":    pro,
+			"showFlash":  flash,
+		}, nil
 	})
 
 	reg.RegisterMutation("setQuotaThreshold", func(params json.RawMessage) (any, error) {
@@ -206,7 +271,7 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 		}
 		_ = json.Unmarshal(params, &p)
 		_ = ctx.DB.SetSetting("quota_threshold", strconv.Itoa(p.Threshold))
-		return map[string]bool{"ok": true}, nil
+		return map[string]any{"ok": true, "threshold": p.Threshold}, nil
 	})
 
 	reg.RegisterHandler("getNetworkEnhance", func(params json.RawMessage) (any, error) {
@@ -219,7 +284,7 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 		_ = json.Unmarshal(params, &p)
 		_ = ctx.DB.SetSetting("network_enhance", strconv.FormatBool(p.Enabled))
 		ctx.Proxy.SetNetworkEnhance(p.Enabled)
-		return map[string]bool{"ok": true}, nil
+		return map[string]any{"ok": true, "networkEnhance": p.Enabled}, nil
 	})
 
 	reg.RegisterHandler("getNetworkMode", func(params json.RawMessage) (any, error) {
@@ -229,36 +294,53 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 	reg.RegisterMutation("setNetworkMode", func(params json.RawMessage) (any, error) {
 		var p struct {
 			NetworkMode int `json:"networkMode"`
+			Mode        int `json:"mode"`
 		}
 		_ = json.Unmarshal(params, &p)
-		if p.NetworkMode <= 1 {
-			p.NetworkMode = 3
+		mode := p.NetworkMode
+		if mode <= 0 {
+			mode = p.Mode
 		}
-		_ = ctx.DB.SetSetting("network_mode", strconv.Itoa(p.NetworkMode))
-		return map[string]bool{"ok": true}, nil
+		if mode <= 1 {
+			mode = 3
+		}
+		_ = ctx.DB.SetSetting("network_mode", strconv.Itoa(mode))
+		return map[string]any{"ok": true, "networkMode": mode}, nil
 	})
 
 	reg.RegisterMutation("setMaxRetries", func(params json.RawMessage) (any, error) {
 		var p struct {
 			MaxRetries int `json:"maxRetries"`
+			Retries    int `json:"retries"`
 		}
 		_ = json.Unmarshal(params, &p)
-		_ = ctx.DB.SetSetting("max_retries", strconv.Itoa(p.MaxRetries))
-		ctx.Proxy.SetMaxRetries(p.MaxRetries)
-		return map[string]bool{"ok": true}, nil
+		retries := p.MaxRetries
+		if retries <= 0 {
+			retries = p.Retries
+		}
+		if retries <= 0 {
+			retries = 3
+		}
+		_ = ctx.DB.SetSetting("max_retries", strconv.Itoa(retries))
+		ctx.Proxy.SetMaxRetries(retries)
+		return map[string]any{"ok": true, "maxRetries": retries}, nil
 	})
 
 	reg.RegisterMutation("enable", func(params json.RawMessage) (any, error) {
 		ctx.Rotation.Enable()
 		return map[string]any{
 			"ok":           true,
+			"enabled":      true,
 			"currentEmail": ctx.Rotation.CurrentEmail(),
 			"currentTier":  ctx.Rotation.CurrentTier(),
 		}, nil
 	})
 	reg.RegisterMutation("disable", func(params json.RawMessage) (any, error) {
 		ctx.Rotation.Disable()
-		return map[string]any{"ok": true}, nil
+		return map[string]any{
+			"ok":      true,
+			"enabled": false,
+		}, nil
 	})
 
 	reg.RegisterMutation("selectAccount", func(params json.RawMessage) (any, error) {
@@ -350,7 +432,7 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 		if err != nil {
 			return nil, err
 		}
-		go ctx.Rotation.FetchAndPushQuota(acc.Email)
+		ctx.Rotation.FetchAndPushQuota(acc.Email)
 		return map[string]bool{"ok": true}, nil
 	})
 

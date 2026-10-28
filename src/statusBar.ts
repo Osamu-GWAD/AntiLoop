@@ -38,6 +38,32 @@ export class StatusBarManager {
   private activeProviderModel: string | null = null;
   private cachedQuota: QuotaData | null = null;
   private cachedQuotaEmail = '';
+  private quotaSettings = { display: true, claude: true, flash: true, pro: true };
+
+  public setQuotaSettings(settings?: {
+    display?: boolean;
+    claude?: boolean;
+    flash?: boolean;
+    pro?: boolean;
+    showClaude?: boolean;
+    showFlash?: boolean;
+    showPro?: boolean;
+  }) {
+    if (!settings) return;
+    if (settings.display !== undefined) this.quotaSettings.display = settings.display;
+    if (settings.claude !== undefined) this.quotaSettings.claude = settings.claude;
+    else if (settings.showClaude !== undefined) this.quotaSettings.claude = settings.showClaude;
+    if (settings.flash !== undefined) this.quotaSettings.flash = settings.flash;
+    else if (settings.showFlash !== undefined) this.quotaSettings.flash = settings.showFlash;
+    if (settings.pro !== undefined) this.quotaSettings.pro = settings.pro;
+    else if (settings.showPro !== undefined) this.quotaSettings.pro = settings.showPro;
+
+    if (!this.quotaSettings.display) {
+      this.hideQuota();
+    } else if (this.cachedQuota) {
+      this.handleQuotaUpdate(this.cachedQuota, this.cachedQuotaEmail);
+    }
+  }
 
   constructor(context: vscode.ExtensionContext) {
     this.statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
@@ -156,6 +182,14 @@ export class StatusBarManager {
   }
 
   public handleQuotaUpdate(quota: QuotaData, email?: string) {
+    this.cachedQuota = quota;
+    this.cachedQuotaEmail = email || this.lastEmail;
+
+    if (!this.quotaSettings.display) {
+      this.hideQuota();
+      return;
+    }
+
     if (!quota || !quota.families || quota.families.length === 0) {
       if (quota?.isUnlimited) {
         this.quotaBarItem.text = '$(infinity) Unlimited';
@@ -167,10 +201,20 @@ export class StatusBarManager {
       return;
     }
 
-    this.cachedQuota = quota;
-    this.cachedQuotaEmail = email || this.lastEmail;
+    const visibleFamilies = quota.families.filter((f) => {
+      const fam = (f.family || f.label || '').toLowerCase();
+      if (fam.includes('claude')) return this.quotaSettings.claude;
+      if (fam.includes('flash')) return this.quotaSettings.flash;
+      if (fam.includes('pro')) return this.quotaSettings.pro;
+      return true;
+    });
 
-    const parts = quota.families.map((f) => `${f.label}:${Math.round(f.percent)}%`);
+    if (visibleFamilies.length === 0) {
+      this.hideQuota();
+      return;
+    }
+
+    const parts = visibleFamilies.map((f) => `${f.label}:${Math.round(f.percent)}%`);
     this.quotaBarItem.text = `$(graph) ${parts.join(' | ')}`;
 
     const md = new vscode.MarkdownString();
@@ -183,7 +227,7 @@ export class StatusBarManager {
 
     md.appendMarkdown('| Family | Remaining | Progress | Resets In |\n');
     md.appendMarkdown('|:-------|:----------|:---------|:----------|\n');
-    for (const f of quota.families) {
+    for (const f of visibleFamilies) {
       const p = Math.round(f.percent);
       const bar = formatProgressBar(p);
       const reset = formatResetCountdown(f.resetTime || quota.resetTime);

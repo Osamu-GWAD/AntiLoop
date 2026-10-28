@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -316,6 +317,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	buf := make([]byte, 4096)
+	var captureBuf bytes.Buffer
+	isFetchModels := resp.StatusCode == http.StatusOK && strings.HasSuffix(path, ":fetchAvailableModels")
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
@@ -323,10 +326,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if isFlusher {
 				flusher.Flush()
 			}
+			if isFetchModels {
+				captureBuf.Write(buf[:n])
+			}
 		}
 		if readErr != nil {
 			break
 		}
+	}
+
+	if isFetchModels && captureBuf.Len() > 0 && email != "" && email != "ide-passthrough" {
+		capturedBytes := captureBuf.Bytes()
+		if resp.Header.Get("Content-Encoding") == "gzip" || (len(capturedBytes) >= 2 && capturedBytes[0] == 0x1f && capturedBytes[1] == 0x8b) {
+			if gzReader, err := gzip.NewReader(bytes.NewReader(capturedBytes)); err == nil {
+				if uncompressed, err := io.ReadAll(gzReader); err == nil {
+					capturedBytes = uncompressed
+				}
+				gzReader.Close()
+			}
+		}
+		go s.rotation.UpdateAccountModelsJSON(email, string(capturedBytes))
 	}
 
 	duration := time.Since(start).Round(time.Millisecond)

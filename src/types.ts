@@ -9,6 +9,7 @@ export interface Account {
   createdAt?: string;
   updatedAt?: string;
   quota?: QuotaData;
+  models?: any[];
 }
 
 export interface QuotaFamily {
@@ -55,6 +56,13 @@ export interface StatusInfo {
   networkMode?: number;
   networkEnhance?: boolean;
   maxRetries?: number;
+  activeFamily?: string;
+  quotaSettings?: {
+    display?: boolean;
+    claude?: boolean;
+    flash?: boolean;
+    pro?: boolean;
+  };
 }
 
 export interface ActivateParams {

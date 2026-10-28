@@ -73,7 +73,18 @@ func main() {
 			daemonIPC.Notify("updateStatus", status)
 		},
 		func(quota any, email string) {
-			daemonIPC.Notify("quotaUpdate", quota)
+			if q, ok := quota.(*rotation.QuotaData); ok && q != nil {
+				daemonIPC.Notify("quotaUpdate", map[string]any{
+					"email":          email,
+					"families":       q.Families,
+					"models":         q.Models,
+					"resetTime":      q.ResetTime,
+					"overallPercent": q.OverallPercent,
+					"isUnlimited":    q.IsUnlimited,
+				})
+			} else {
+				daemonIPC.Notify("quotaUpdate", quota)
+			}
 		},
 		func(msg string) {
 			daemonIPC.Notify("initProgress", map[string]string{"message": msg})

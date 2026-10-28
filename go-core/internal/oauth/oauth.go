@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -277,13 +278,29 @@ func FetchUserInfo(accessToken string) (*UserInfo, error) {
 	return &u, nil
 }
 
+func getPlatformString() string {
+	osStr := runtime.GOOS
+	switch osStr {
+	case "darwin":
+		osStr = "Darwin"
+	case "windows":
+		osStr = "Windows"
+	case "linux":
+		osStr = "Linux"
+	}
+	archStr := runtime.GOARCH
+	if archStr == "amd64" {
+		archStr = "x64"
+	}
+	return fmt.Sprintf("%s; %s", osStr, archStr)
+}
+
 func LoadCodeAssist(accessToken, ideVersion, idePlatform string) (string, string, error) {
 	reqBody := map[string]any{
 		"metadata": map[string]string{
 			"ide_type":    "ANTIGRAVITY",
 			"ide_name":    "antigravity",
 			"ide_version": ideVersion,
-			"platform":    idePlatform,
 		},
 	}
 	raw, _ := json.Marshal(reqBody)
@@ -294,6 +311,7 @@ func LoadCodeAssist(accessToken, ideVersion, idePlatform string) (string, string
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", fmt.Sprintf("antigravity/%s (%s)", ideVersion, getPlatformString()))
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -311,25 +329,47 @@ func LoadCodeAssist(accessToken, ideVersion, idePlatform string) (string, string
 	}
 
 	var out struct {
-		CurrentTier string `json:"currentTier"`
-		PaidTier    string `json:"paidTier"`
-		ProjectID   string `json:"projectId"`
-		AllowedTiers []string `json:"allowedTiers"`
+		CurrentTier             string `json:"currentTier"`
+		PaidTier                any    `json:"paidTier"`
+		ProjectID               string `json:"projectId"`
+		AllowedTiers            []any  `json:"allowedTiers"`
+		CloudaicompanionProject any    `json:"cloudaicompanionProject"`
 	}
 	_ = json.Unmarshal(body, &out)
 
 	tier := out.CurrentTier
 	if tier == "" {
-		tier = out.PaidTier
+		if ptMap, ok := out.PaidTier.(map[string]any); ok {
+			if id, ok := ptMap["id"].(string); ok {
+				tier = id
+			}
+		} else if ptStr, ok := out.PaidTier.(string); ok {
+			tier = ptStr
+		}
 	}
 	if tier == "" && len(out.AllowedTiers) > 0 {
-		tier = out.AllowedTiers[0]
+		if first, ok := out.AllowedTiers[0].(map[string]any); ok {
+			if id, ok := first["id"].(string); ok {
+				tier = id
+			}
+		} else if firstStr, ok := out.AllowedTiers[0].(string); ok {
+			tier = firstStr
+		}
 	}
 	if tier == "" {
 		tier = "standard"
 	}
 
-	return normalizeTier(tier), out.ProjectID, nil
+	projID := out.ProjectID
+	if projID == "" {
+		if cpMap, ok := out.CloudaicompanionProject.(map[string]any); ok {
+			if id, ok := cpMap["id"].(string); ok {
+				projID = id
+			}
+		}
+	}
+
+	return normalizeTier(tier), projID, nil
 }
 
 func normalizeTier(t string) string {
@@ -355,9 +395,8 @@ func OnboardUser(accessToken, ideVersion, idePlatform string) (string, error) {
 			"ide_type":    "ANTIGRAVITY",
 			"ide_name":    "antigravity",
 			"ide_version": ideVersion,
-			"platform":    idePlatform,
 		},
-		"tier": "standard",
+		"tierId": "standard-tier",
 	}
 	raw, _ := json.Marshal(reqBody)
 
@@ -367,6 +406,7 @@ func OnboardUser(accessToken, ideVersion, idePlatform string) (string, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", fmt.Sprintf("antigravity/%s (%s)", ideVersion, getPlatformString()))
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -381,9 +421,17 @@ func OnboardUser(accessToken, ideVersion, idePlatform string) (string, error) {
 
 	var out struct {
 		ProjectID string `json:"projectId"`
+		Response  struct {
+			CloudaicompanionProject struct {
+				ID string `json:"id"`
+			} `json:"cloudaicompanionProject"`
+		} `json:"response"`
 	}
 	_ = json.Unmarshal(body, &out)
-	return out.ProjectID, nil
+	if out.ProjectID != "" {
+		return out.ProjectID, nil
+	}
+	return out.Response.CloudaicompanionProject.ID, nil
 }
 
 func FetchAvailableModels(accessToken, projectID string) (map[string]any, error) {
@@ -393,45 +441,38 @@ func FetchAvailableModels(accessToken, projectID string) (map[string]any, error)
 	}
 	raw, _ := json.Marshal(reqBody)
 
-	endpoints := []string{
-		"https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-		"https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+	endpoint := "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+
+	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", fmt.Sprintf("antigravity/%s (%s)", currIdeVer, getPlatformString()))
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
 	}
 
-	var lastErr error
-	for _, endpoint := range endpoints {
-		req, err := http.NewRequest("POST", endpoint, bytes.NewReader(raw))
-		if err != nil {
-			lastErr = err
-			continue
+	if resp.StatusCode == http.StatusOK {
+		var out map[string]any
+		if err := json.Unmarshal(body, &out); err == nil {
+			return out, nil
 		}
-		req.Header.Set("Authorization", "Bearer "+accessToken)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Goog-Api-Client", "gl-node/22.21.1")
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		if resp.StatusCode == http.StatusOK {
-			var out map[string]any
-			if err := json.Unmarshal(body, &out); err == nil {
-				return out, nil
-			}
-			lastErr = fmt.Errorf("json unmarshal models: %w", err)
-		} else {
-			lastErr = fmt.Errorf("fetchAvailableModels %s failed (HTTP %d): %s", endpoint, resp.StatusCode, string(body))
-		}
+		return nil, fmt.Errorf("json unmarshal models: %w", err)
 	}
 
-	return nil, lastErr
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return map[string]any{"quotaExhausted": true}, nil
+	}
+
+	return nil, fmt.Errorf("fetchAvailableModels %s failed (HTTP %d): %s", endpoint, resp.StatusCode, string(body))
 }

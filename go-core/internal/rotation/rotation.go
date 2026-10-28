@@ -1,8 +1,12 @@
 package rotation
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,8 +26,18 @@ type QuotaFamily struct {
 	ResetTime string  `json:"resetTime,omitempty"`
 }
 
+type ModelItem struct {
+	Name              string  `json:"name"`
+	DisplayName       string  `json:"displayName"`
+	Percent           float64 `json:"percent"`
+	RemainingPercent  float64 `json:"remainingPercent"`
+	RemainingFraction float64 `json:"remainingFraction"`
+	ResetTime         string  `json:"resetTime,omitempty"`
+}
+
 type QuotaData struct {
 	Families       []QuotaFamily `json:"families"`
+	Models         []ModelItem   `json:"models,omitempty"`
 	ResetTime      string        `json:"resetTime,omitempty"`
 	OverallPercent float64       `json:"overallPercent,omitempty"`
 	IsUnlimited    bool          `json:"isUnlimited,omitempty"`
@@ -244,6 +258,38 @@ func (m *Manager) PushCurrentQuota() {
 	}
 }
 
+func (m *Manager) GetAccountAccessToken(acc *storage.Account) (string, error) {
+	if acc == nil {
+		return "", fmt.Errorf("account is nil")
+	}
+
+	var expSec int64
+	if acc.TokenExpiresAt != "" {
+		if t, err := time.Parse(time.RFC3339, acc.TokenExpiresAt); err == nil {
+			expSec = t.Unix()
+		}
+	}
+
+	now := time.Now().Unix()
+	if (expSec <= now+60 || acc.AccessToken == "") && acc.RefreshToken != "" {
+		applog.Printf("[rotation] refreshing expired token for %s", acc.Email)
+		tok, err := oauth.RefreshAccessToken(acc.RefreshToken)
+		if err != nil {
+			applog.Printf("[rotation] token refresh failed for %s: %v", acc.Email, err)
+			if acc.AccessToken != "" {
+				return acc.AccessToken, nil
+			}
+			return "", err
+		}
+		newExp := time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).UTC().Format(time.RFC3339)
+		acc.AccessToken = tok.AccessToken
+		acc.TokenExpiresAt = newExp
+		_ = m.db.UpdateAccountToken(acc.ID, tok.AccessToken, newExp)
+	}
+
+	return acc.AccessToken, nil
+}
+
 func (m *Manager) FetchAndPushQuota(email string) {
 	var acc *storage.Account
 	var err error
@@ -258,7 +304,7 @@ func (m *Manager) FetchAndPushQuota(email string) {
 		return
 	}
 
-	tok, err := m.GetActiveAccessToken()
+	tok, err := m.GetAccountAccessToken(acc)
 	if err != nil {
 		applog.Printf("[rotation] failed to get token for quota check %s: %v", acc.Email, err)
 		return
@@ -275,7 +321,9 @@ func (m *Manager) FetchAndPushQuota(email string) {
 
 	quota := ParseQuota(data)
 	m.mu.Lock()
-	m.quotaSnapshot = quota
+	if m.currentAccount != nil && m.currentAccount.Email == acc.Email {
+		m.quotaSnapshot = quota
+	}
 	m.mu.Unlock()
 
 	if m.onQuotaUpdate != nil {
@@ -283,22 +331,93 @@ func (m *Manager) FetchAndPushQuota(email string) {
 	}
 }
 
+func (m *Manager) UpdateAccountModelsJSON(email, modelsJSON string) {
+	if email == "" || modelsJSON == "" {
+		return
+	}
+	rawBytes := []byte(modelsJSON)
+	if len(rawBytes) >= 2 && rawBytes[0] == 0x1f && rawBytes[1] == 0x8b {
+		if gzReader, err := gzip.NewReader(bytes.NewReader(rawBytes)); err == nil {
+			if uncompressed, err := io.ReadAll(gzReader); err == nil {
+				rawBytes = uncompressed
+				modelsJSON = string(rawBytes)
+			}
+			gzReader.Close()
+		}
+	}
+
+	acc, err := m.db.GetAccountByEmail(email)
+	if err != nil || acc == nil {
+		return
+	}
+	_ = m.db.UpdateAccountModels(acc.ID, modelsJSON)
+
+	var data map[string]any
+	if err := json.Unmarshal(rawBytes, &data); err == nil {
+		quota := ParseQuota(data)
+		m.mu.Lock()
+		if m.currentAccount != nil && m.currentAccount.Email == email {
+			m.quotaSnapshot = quota
+		}
+		m.mu.Unlock()
+		if m.onQuotaUpdate != nil {
+			m.onQuotaUpdate(quota, email)
+		}
+	}
+}
+
 func ParseQuota(data map[string]any) *QuotaData {
-	models, ok := data["models"].([]any)
-	if !ok || len(models) == 0 {
+	if data == nil {
+		return &QuotaData{IsUnlimited: true}
+	}
+
+	if exhausted, _ := data["quotaExhausted"].(bool); exhausted {
+		zeroFamilies := []QuotaFamily{
+			{Name: "claude", Label: "Claude", Percent: 0},
+			{Name: "pro", Label: "Gemini Pro", Percent: 0},
+			{Name: "flash", Label: "Gemini Flash", Percent: 0},
+		}
+		zeroModels := []ModelItem{
+			{Name: "Claude", DisplayName: "Claude", Percent: 0, RemainingPercent: 0},
+			{Name: "Gemini Pro", DisplayName: "Gemini Pro", Percent: 0, RemainingPercent: 0},
+			{Name: "Gemini Flash", DisplayName: "Gemini Flash", Percent: 0, RemainingPercent: 0},
+		}
+		return &QuotaData{
+			Families: zeroFamilies,
+			Models:   zeroModels,
+		}
+	}
+
+	var rawModels []map[string]any
+
+	if slice, ok := data["models"].([]any); ok {
+		for _, item := range slice {
+			if mMap, ok := item.(map[string]any); ok {
+				rawModels = append(rawModels, mMap)
+			}
+		}
+	} else if mMap, ok := data["models"].(map[string]any); ok {
+		for _, item := range mMap {
+			if subMap, ok := item.(map[string]any); ok {
+				rawModels = append(rawModels, subMap)
+			}
+		}
+	}
+
+	if len(rawModels) == 0 {
 		return &QuotaData{IsUnlimited: true}
 	}
 
 	var claudeFamily, proFamily, flashFamily *QuotaFamily
 	var earliestReset string
+	var modelItems []ModelItem
 
-	for _, m := range models {
-		mMap, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
+	for _, mMap := range rawModels {
 		name, _ := mMap["name"].(string)
 		displayName, _ := mMap["displayName"].(string)
+		if displayName == "" {
+			displayName = name
+		}
 		lower := strings.ToLower(name + " " + displayName)
 
 		quotaInfo, _ := mMap["quotaInfo"].(map[string]any)
@@ -308,15 +427,28 @@ func ParseQuota(data map[string]any) *QuotaData {
 
 		remaining, _ := quotaInfo["remainingRequests"].(float64)
 		limit, _ := quotaInfo["limit"].(float64)
+		remFrac, hasFrac := quotaInfo["remainingFraction"].(float64)
 		resetTime, _ := quotaInfo["resetTime"].(string)
 		if resetTime != "" && (earliestReset == "" || resetTime < earliestReset) {
 			earliestReset = resetTime
 		}
 
 		percent := 100.0
-		if limit > 0 {
+		if hasFrac {
+			percent = remFrac * 100.0
+		} else if limit > 0 {
 			percent = (remaining / limit) * 100.0
 		}
+		percent = math.Round(percent)
+
+		modelItems = append(modelItems, ModelItem{
+			Name:              displayName,
+			DisplayName:       displayName,
+			Percent:           percent,
+			RemainingPercent:  percent,
+			RemainingFraction: percent / 100.0,
+			ResetTime:         resetTime,
+		})
 
 		if strings.Contains(lower, "claude") {
 			if claudeFamily == nil || percent < claudeFamily.Percent {
@@ -365,18 +497,19 @@ func ParseQuota(data map[string]any) *QuotaData {
 		families = append(families, *flashFamily)
 	}
 
-	if len(families) == 0 {
+	if len(families) == 0 && len(modelItems) == 0 {
 		return &QuotaData{IsUnlimited: true}
 	}
 
 	return &QuotaData{
 		Families:  families,
+		Models:    modelItems,
 		ResetTime: earliestReset,
 	}
 }
 
 func (m *Manager) RunQuotaWatch() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
 	for {

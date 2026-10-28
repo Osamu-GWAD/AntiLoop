@@ -99,6 +99,9 @@ export async function activate(context: vscode.ExtensionContext) {
       ) {
         syncActiveProviderToStatusBar();
       }
+      if (action === 'setQuotaSettings') {
+        statusBar?.setQuotaSettings(params);
+      }
     },
     async (method, params) => {
       if (method === 'setProxyEnabled') {
@@ -208,6 +211,9 @@ export async function activate(context: vscode.ExtensionContext) {
         accountsProvider?.refreshState();
         daemonClient?.send('getStatus', {}).then((st: StatusInfo) => {
           applyProxyUrl(st.proxyEnabled, st.proxyPort);
+          if (st.quotaSettings) {
+            statusBar?.setQuotaSettings(st.quotaSettings);
+          }
         }).catch(() => {});
         break;
 
@@ -380,6 +386,13 @@ async function activateDaemon(
   state.currentEmail = res.currentEmail || '';
   log(`activate result: email=${res.currentEmail}, tier=${res.currentTier}, autoEnabled=${res.autoEnabled}, proxyPort=${res.proxyPort || 'none'}`);
 
+  daemonClient
+    ?.send('getStatus', {})
+    .then((st: StatusInfo) => {
+      if (st.quotaSettings) statusBar?.setQuotaSettings(st.quotaSettings);
+    })
+    .catch(() => {});
+
   await applyProxyUrl(res.proxyEnabled, res.proxyPort);
 
   if (res.autoEnabled) {
@@ -492,6 +505,13 @@ async function applyProxyUrl(enabled: boolean, port?: number) {
 
 async function handleSetProxyEnabled(params: { enabled: boolean }) {
   const res = await daemonClient!.send('setProxyEnabled', params);
+  daemonClient
+    ?.send('getStatus', {})
+    .then((st: StatusInfo) => {
+      if (st.quotaSettings) statusBar?.setQuotaSettings(st.quotaSettings);
+    })
+    .catch(() => {});
+
   await applyProxyUrl(res.proxyEnabled, res.proxyPort);
   const reload = 'Reload Now';
   const chosen = await vscode.window.showInformationMessage(
