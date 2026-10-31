@@ -76,6 +76,18 @@
         "title": "AntiLoop: Warm Up All Accounts (Start 5h Limit)"
       },
       {
+        "command": "antiLoop.linkObsidian",
+        "title": "AntiLoop: Link Obsidian Vault (Zero-Hallucination Grounding)"
+      },
+      {
+        "command": "antiLoop.unlinkObsidian",
+        "title": "AntiLoop: Unlink Obsidian Vault"
+      },
+      {
+        "command": "antiLoop.obsidianStatus",
+        "title": "AntiLoop: Obsidian Vault Status"
+      },
+      {
         "command": "antiLoop.refreshAll",
         "title": "AntiLoop: Refresh All Accounts"
       },

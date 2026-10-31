@@ -1,7 +1,5 @@
 # AntiLoop
 
-[中文](https://github.com/Osamu-GWAD/AntiLoop/blob/main/README.zh-CN.md) | **English**
-
 > Intelligent multi-account rotation, quota management, and network optimization for Antigravity IDE.
 
 ## Highlights
@@ -34,6 +32,20 @@
 ### 4. Real-Time Status Bar Quota Display
 - **Status Bar Integration:** View remaining quota percentages for Claude, Gemini Pro, and Gemini Flash directly in the status bar.
 - **Rich Hover Tooltips:** Detailed Markdown breakdown of quota percentages, visual progress bars, and reset countdowns.
+
+### 5. Auto Warmup (Start Rolling 5h Quota Windows)
+- **One-Click Limit Initialization:** Simultaneously fires lightweight warmup requests across all accounts in your pool to initiate their 5-hour rolling rate limit windows in advance.
+- **Maximized Effective Quota:** By starting the timer on secondary accounts early, their limits refresh sooner without having to wait until an account switch occurs.
+- **Command:** `AntiLoop: Warm Up All Accounts (Start 5h Limit)` (`antiLoop.warmupAll`).
+
+### 6. Obsidian Grounding (Zero-Hallucination AI Memory)
+- **Persistent Second Brain:** Connects Antigravity and Gemini to your Obsidian vault via the Model Context Protocol (`obsidian-mcp`).
+- **Eliminates Hallucinations:** Grounds AI reasoning directly on your existing markdown documentation, project context, and decisions using bidirectional search (`search_notes`, `read_note`) and automated memory capture (`append_note`, `update_note`).
+- **Native Antigravity MCP Integration:** Automatically updates your global `~/.gemini/config/mcp_config.json` and registers the server with `agy mcp`.
+- **Commands:**
+  - `AntiLoop: Link Obsidian Vault (Zero-Hallucination Grounding)` (`antiLoop.linkObsidian`)
+  - `AntiLoop: Obsidian Vault Status` (`antiLoop.obsidianStatus`)
+  - `AntiLoop: Unlink Obsidian Vault` (`antiLoop.unlinkObsidian`)
 
 ---
 
