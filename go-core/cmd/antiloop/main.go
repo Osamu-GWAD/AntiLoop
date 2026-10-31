@@ -116,9 +116,13 @@ func main() {
 
 	activeProviderIDStr := db.GetSettingDefault("active_provider_id", "0")
 	if activeID, _ := strconv.ParseInt(activeProviderIDStr, 10, 64); activeID > 0 {
-		if prov, err := db.GetProviderWithKey(activeID); err == nil {
-			proxyServer.UpstreamRouter().SetActiveProvider(prov)
-			applog.Printf("[main] restored active third-party provider: %s", prov.Name)
+		if prov, err := db.GetProviderWithKey(activeID); err == nil && prov != nil {
+			if prov.BaseURL != "" && prov.ModelID != "" {
+				proxyServer.UpstreamRouter().SetActiveProvider(prov)
+				applog.Printf("[main] restored active third-party provider: %s", prov.Name)
+			} else {
+				applog.Printf("[main] provider %s (ID %d) has empty BaseURL or ModelID, ignoring", prov.Name, activeID)
+			}
 		}
 	}
 

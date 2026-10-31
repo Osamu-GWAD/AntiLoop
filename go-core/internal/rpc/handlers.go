@@ -350,6 +350,10 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 		}
 		_ = json.Unmarshal(params, &p)
 
+		// When selecting a Google account, deactivate any active external provider.
+		_ = ctx.DB.SetSetting("active_provider_id", "0")
+		ctx.Proxy.UpstreamRouter().SetActiveProvider(nil)
+
 		var acc *storage.Account
 		var err error
 		if p.ID > 0 {
@@ -546,18 +550,50 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 
 	reg.RegisterMutation("addProvider", func(params json.RawMessage) (any, error) {
 		var p struct {
-			Name             string `json:"name"`
-			APIType          string `json:"api_type"`
-			BaseURL          string `json:"base_url"`
-			APIKey           string `json:"api_key"`
-			ModelID          string `json:"model_id"`
-			ExtraHeaders     string `json:"extra_headers"`
-			ExtraParams      string `json:"extra_params"`
-			MaxContextTokens int    `json:"max_context_tokens"`
-			MaxOutputTokens  int    `json:"max_output_tokens"`
+			Name                  string `json:"name"`
+			APIType               string `json:"api_type"`
+			APITypeCamel          string `json:"apiType"`
+			BaseURL               string `json:"base_url"`
+			BaseURLCamel          string `json:"baseUrl"`
+			APIKey                string `json:"api_key"`
+			APIKeyCamel           string `json:"apiKey"`
+			ModelID               string `json:"model_id"`
+			ModelIDCamel          string `json:"modelId"`
+			ExtraHeaders          string `json:"extra_headers"`
+			ExtraHeadersCamel     string `json:"extraHeaders"`
+			ExtraParams           string `json:"extra_params"`
+			ExtraParamsCamel      string `json:"extraParams"`
+			MaxContextTokens      int    `json:"max_context_tokens"`
+			MaxContextTokensCamel int    `json:"maxContextTokens"`
+			MaxOutputTokens       int    `json:"max_output_tokens"`
+			MaxOutputTokensCamel  int    `json:"maxOutputTokens"`
 		}
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
+		}
+		if p.APIType == "" {
+			p.APIType = p.APITypeCamel
+		}
+		if p.BaseURL == "" {
+			p.BaseURL = p.BaseURLCamel
+		}
+		if p.APIKey == "" {
+			p.APIKey = p.APIKeyCamel
+		}
+		if p.ModelID == "" {
+			p.ModelID = p.ModelIDCamel
+		}
+		if p.ExtraHeaders == "" {
+			p.ExtraHeaders = p.ExtraHeadersCamel
+		}
+		if p.ExtraParams == "" {
+			p.ExtraParams = p.ExtraParamsCamel
+		}
+		if p.MaxContextTokens == 0 {
+			p.MaxContextTokens = p.MaxContextTokensCamel
+		}
+		if p.MaxOutputTokens == 0 {
+			p.MaxOutputTokens = p.MaxOutputTokensCamel
 		}
 		prov, err := ctx.DB.AddProvider(
 			p.Name, p.APIType, p.BaseURL, p.APIKey, p.ModelID,
@@ -568,24 +604,64 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 
 	reg.RegisterMutation("updateProvider", func(params json.RawMessage) (any, error) {
 		var p struct {
-			ID               int64  `json:"id"`
-			Name             string `json:"name"`
-			APIType          string `json:"api_type"`
-			BaseURL          string `json:"base_url"`
-			APIKey           string `json:"api_key"`
-			ModelID          string `json:"model_id"`
-			ExtraHeaders     string `json:"extra_headers"`
-			ExtraParams      string `json:"extra_params"`
-			MaxContextTokens int    `json:"max_context_tokens"`
-			MaxOutputTokens  int    `json:"max_output_tokens"`
+			ID                    int64  `json:"id"`
+			Name                  string `json:"name"`
+			APIType               string `json:"api_type"`
+			APITypeCamel          string `json:"apiType"`
+			BaseURL               string `json:"base_url"`
+			BaseURLCamel          string `json:"baseUrl"`
+			APIKey                string `json:"api_key"`
+			APIKeyCamel           string `json:"apiKey"`
+			ModelID               string `json:"model_id"`
+			ModelIDCamel          string `json:"modelId"`
+			ExtraHeaders          string `json:"extra_headers"`
+			ExtraHeadersCamel     string `json:"extraHeaders"`
+			ExtraParams           string `json:"extra_params"`
+			ExtraParamsCamel      string `json:"extraParams"`
+			MaxContextTokens      int    `json:"max_context_tokens"`
+			MaxContextTokensCamel int    `json:"maxContextTokens"`
+			MaxOutputTokens       int    `json:"max_output_tokens"`
+			MaxOutputTokensCamel  int    `json:"maxOutputTokens"`
 		}
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, err
+		}
+		if p.APIType == "" {
+			p.APIType = p.APITypeCamel
+		}
+		if p.BaseURL == "" {
+			p.BaseURL = p.BaseURLCamel
+		}
+		if p.APIKey == "" {
+			p.APIKey = p.APIKeyCamel
+		}
+		if p.ModelID == "" {
+			p.ModelID = p.ModelIDCamel
+		}
+		if p.ExtraHeaders == "" {
+			p.ExtraHeaders = p.ExtraHeadersCamel
+		}
+		if p.ExtraParams == "" {
+			p.ExtraParams = p.ExtraParamsCamel
+		}
+		if p.MaxContextTokens == 0 {
+			p.MaxContextTokens = p.MaxContextTokensCamel
+		}
+		if p.MaxOutputTokens == 0 {
+			p.MaxOutputTokens = p.MaxOutputTokensCamel
 		}
 		err := ctx.DB.UpdateProvider(
 			p.ID, p.Name, p.APIType, p.BaseURL, p.APIKey, p.ModelID,
 			p.ExtraHeaders, p.ExtraParams, p.MaxContextTokens, p.MaxOutputTokens,
 		)
+		if err == nil {
+			activeIDStr := ctx.DB.GetSettingDefault("active_provider_id", "0")
+			if activeIDStr == strconv.FormatInt(p.ID, 10) {
+				if prov, getErr := ctx.DB.GetProviderWithKey(p.ID); getErr == nil {
+					ctx.Proxy.UpstreamRouter().SetActiveProvider(prov)
+				}
+			}
+		}
 		return map[string]bool{"ok": err == nil}, err
 	})
 
@@ -611,16 +687,24 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 		}
 		_ = json.Unmarshal(params, &p)
 		err := ctx.DB.ToggleProviderEnabled(p.ID, p.Enabled)
+		if !p.Enabled {
+			activeIDStr := ctx.DB.GetSettingDefault("active_provider_id", "0")
+			if activeIDStr == strconv.FormatInt(p.ID, 10) {
+				_ = ctx.DB.SetSetting("active_provider_id", "0")
+				ctx.Proxy.UpstreamRouter().SetActiveProvider(nil)
+			}
+		}
 		return map[string]bool{"ok": err == nil}, err
 	})
 
 	reg.RegisterMutation("selectProvider", func(params json.RawMessage) (any, error) {
 		var p struct {
-			ID *int64 `json:"id"`
+			ID      *int64 `json:"id"`
+			Enabled *bool  `json:"enabled"`
 		}
 		_ = json.Unmarshal(params, &p)
 
-		if p.ID == nil || *p.ID <= 0 {
+		if p.ID == nil || *p.ID <= 0 || (p.Enabled != nil && !*p.Enabled) {
 			_ = ctx.DB.SetSetting("active_provider_id", "0")
 			ctx.Proxy.UpstreamRouter().SetActiveProvider(nil)
 			applog.Println("[rpc] cleared active provider (using Google accounts)")
@@ -630,6 +714,9 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 		prov, err := ctx.DB.GetProviderWithKey(*p.ID)
 		if err != nil {
 			return nil, err
+		}
+		if prov.BaseURL == "" || prov.ModelID == "" {
+			return map[string]any{"ok": false, "error": "provider is missing base URL or model ID"}, nil
 		}
 		_ = ctx.DB.SetSetting("active_provider_id", strconv.FormatInt(*p.ID, 10))
 		ctx.Proxy.UpstreamRouter().SetActiveProvider(prov)

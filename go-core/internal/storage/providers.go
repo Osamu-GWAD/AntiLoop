@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"encoding/json"
 	"time"
 )
 
@@ -20,6 +21,35 @@ type Provider struct {
 	SortOrder        int    `json:"sort_order"`
 	CreatedAt        string `json:"created_at"`
 	UpdatedAt        string `json:"updated_at"`
+}
+
+func (p *Provider) MarshalJSON() ([]byte, error) {
+	type Alias Provider
+	return json.Marshal(&struct {
+		*Alias
+		APITypeCamel          string `json:"apiType"`
+		BaseURLCamel          string `json:"baseUrl"`
+		ModelIDCamel          string `json:"modelId"`
+		ExtraHeadersCamel     string `json:"extraHeaders,omitempty"`
+		ExtraParamsCamel      string `json:"extraParams,omitempty"`
+		MaxContextTokensCamel int    `json:"maxContextTokens,omitempty"`
+		MaxOutputTokensCamel  int    `json:"maxOutputTokens,omitempty"`
+		SortOrderCamel        int    `json:"sortOrder,omitempty"`
+		CreatedAtCamel        string `json:"createdAt,omitempty"`
+		UpdatedAtCamel        string `json:"updatedAt,omitempty"`
+	}{
+		Alias:                 (*Alias)(p),
+		APITypeCamel:          p.APIType,
+		BaseURLCamel:          p.BaseURL,
+		ModelIDCamel:          p.ModelID,
+		ExtraHeadersCamel:     p.ExtraHeaders,
+		ExtraParamsCamel:      p.ExtraParams,
+		MaxContextTokensCamel: p.MaxContextTokens,
+		MaxOutputTokensCamel:  p.MaxOutputTokens,
+		SortOrderCamel:        p.SortOrder,
+		CreatedAtCamel:        p.CreatedAt,
+		UpdatedAtCamel:        p.UpdatedAt,
+	})
 }
 
 func (d *DB) ListProviders() ([]*Provider, error) {

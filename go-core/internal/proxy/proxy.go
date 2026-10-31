@@ -159,6 +159,62 @@ func (s *Server) getBaseUpstreamURL() string {
 	return "https://cloudcode-pa.googleapis.com"
 }
 
+func isGenerationRequest(path string) bool {
+	return strings.HasSuffix(path, ":streamGenerateContent") ||
+		strings.HasSuffix(path, ":generateContent") ||
+		strings.HasSuffix(path, "/chat/completions") ||
+		strings.HasSuffix(path, "/completions") ||
+		strings.HasSuffix(path, "/messages")
+}
+
+func (s *Server) handleExternalMockDiscovery(w http.ResponseWriter, r *http.Request, path string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.WriteHeader(http.StatusOK)
+
+	switch {
+	case strings.HasSuffix(path, "/cascadeNuxes"):
+		w.Write([]byte(`{"nuxes":[]}`))
+	case strings.HasSuffix(path, ":fetchUserInfo"):
+		w.Write([]byte(`{"userTier":"PRO","userEmail":"external@antiloop.local"}`))
+	case strings.HasSuffix(path, ":loadCodeAssist"):
+		w.Write([]byte(`{"currentTier":"pro","cloudaicompanionProject":{"id":"projects/antiloop-external"}}`))
+	case strings.HasSuffix(path, ":listExperiments"):
+		w.Write([]byte(`{"experiments":[]}`))
+	case strings.HasSuffix(path, ":fetchAvailableModels"):
+		prov := s.router.ActiveProvider()
+		modelName := "External Model"
+		modelID := "external-model"
+		if prov != nil && prov.ModelID != "" {
+			modelID = prov.ModelID
+			if prov.Name != "" {
+				modelName = prov.Name
+			} else {
+				modelName = prov.ModelID
+			}
+		}
+		resp := map[string]any{
+			"agentModelSorts": []map[string]any{
+				{
+					"displayName": "Recommended",
+					"groups": []map[string]any{
+						{"modelIds": []string{modelID}},
+					},
+				},
+			},
+			"models": []map[string]any{
+				{
+					"name":        modelID,
+					"displayName": modelName,
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	default:
+		w.Write([]byte(`{}`))
+	}
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	path := r.URL.Path
@@ -179,7 +235,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.router.ActiveProvider() != nil {
+	if s.router.IsActive() && isGenerationRequest(path) {
 		s.router.HandleRequest(w, r)
 		return
 	}
@@ -200,6 +256,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			token = strings.TrimSpace(token)
 			isPassThrough = true
 			applog.Printf("[proxy] using pass-through token from IDE (no active AntiLoop account)")
+		} else if s.router.IsActive() {
+			s.handleExternalMockDiscovery(w, r, path)
+			return
 		} else {
 			applog.Printf("[proxy] token error: %v (no pass-through Authorization available)", err)
 			http.Error(w, "No active account token", http.StatusUnauthorized)
