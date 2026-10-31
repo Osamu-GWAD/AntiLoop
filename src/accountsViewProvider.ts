@@ -73,6 +73,8 @@ export const MUTATION_METHODS = new Set([
   'setNetworkEnhance',
   'setNetworkMode',
   'setMaxRetries',
+  'warmupAccounts',
+  'setAutoWarmup',
 ]);
 
 export class AccountsViewProvider implements vscode.WebviewViewProvider {

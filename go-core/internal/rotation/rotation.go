@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,6 +25,12 @@ type TokenInfo struct {
 	AccessToken       string `json:"accessToken"`
 	RefreshToken      string `json:"refreshToken"`
 	ExpiryDateSeconds int64  `json:"expiryDateSeconds"`
+}
+
+type WarmupResult struct {
+	Email   string `json:"email"`
+	Success bool   `json:"success"`
+	Message string `json:"message"`
 }
 
 type QuotaFamily struct {
@@ -244,6 +251,9 @@ func (m *Manager) EnsureActiveAccount() {
 			if tok, tokErr := m.GetAccountAccessToken(acc); tokErr == nil && tok != "" {
 				m.syncStandaloneToken(acc, tok)
 			}
+			if m.db.GetSettingDefault("auto_warmup", "false") == "true" {
+				go m.WarmupAllAccounts()
+			}
 			return
 		}
 	}
@@ -255,6 +265,9 @@ func (m *Manager) EnsureActiveAccount() {
 		applog.Printf("[rotation] active account set to first available: %s", accounts[0].Email)
 		if tok, tokErr := m.GetAccountAccessToken(accounts[0]); tokErr == nil && tok != "" {
 			m.syncStandaloneToken(accounts[0], tok)
+		}
+		if m.db.GetSettingDefault("auto_warmup", "false") == "true" {
+			go m.WarmupAllAccounts()
 		}
 	}
 }
@@ -435,6 +448,9 @@ func (m *Manager) FetchAndPushQuota(email string) {
 	if m.onQuotaUpdate != nil {
 		m.onQuotaUpdate(quota, acc.Email)
 	}
+	if m.IsEnabled() && m.currentAccount != nil && m.currentAccount.Email == acc.Email {
+		m.checkAutoRotation()
+	}
 }
 
 func (m *Manager) UpdateAccountModelsJSON(email, modelsJSON string) {
@@ -468,6 +484,9 @@ func (m *Manager) UpdateAccountModelsJSON(email, modelsJSON string) {
 		m.mu.Unlock()
 		if m.onQuotaUpdate != nil {
 			m.onQuotaUpdate(quota, email)
+		}
+		if m.IsEnabled() && m.currentAccount != nil && m.currentAccount.Email == email {
+			m.checkAutoRotation()
 		}
 	}
 }
@@ -638,27 +657,40 @@ func (m *Manager) checkAutoRotation() {
 	m.mu.RLock()
 	q := m.quotaSnapshot
 	thresholdStr := m.db.GetSettingDefault("quota_threshold", "10")
+	benchmark := m.db.GetSettingDefault("active_model_family", "claude")
 	m.mu.RUnlock()
 
 	if q == nil || len(q.Families) == 0 {
 		return
 	}
 
-	threshold, _ := strconv.ParseFloat(thresholdStr, 64)
-	if threshold <= 0 {
+	threshold, err := strconv.ParseFloat(thresholdStr, 64)
+	if err != nil || threshold < 0 {
 		threshold = 10
 	}
 
 	low := false
+	benchmarkFound := false
 	for _, f := range q.Families {
-		if f.Percent < threshold {
-			low = true
+		if strings.EqualFold(f.Name, benchmark) {
+			benchmarkFound = true
+			if f.Percent <= threshold {
+				low = true
+			}
 			break
+		}
+	}
+	if !benchmarkFound {
+		for _, f := range q.Families {
+			if f.Percent <= threshold {
+				low = true
+				break
+			}
 		}
 	}
 
 	if low {
-		applog.Printf("[rotation] quota below threshold (%.1f%%) — rotating account", threshold)
+		applog.Printf("[rotation] %s quota below or at threshold (%.1f%%) — rotating account", benchmark, threshold)
 		m.RotateToNextAccount()
 	}
 }
@@ -682,4 +714,90 @@ func (m *Manager) RotateToNextAccount() {
 	}
 
 	_, _ = m.SelectAccount(next.ID)
+}
+
+func (m *Manager) WarmupAccount(acc *storage.Account) *WarmupResult {
+	if acc == nil {
+		return &WarmupResult{Success: false, Message: "account is nil"}
+	}
+
+	tok, err := m.GetAccountAccessToken(acc)
+	if err != nil || tok == "" {
+		return &WarmupResult{Email: acc.Email, Success: false, Message: fmt.Sprintf("failed to get token: %v", err)}
+	}
+
+	modelsToPing := []string{"gemini-2.5-flash", "claude-sonnet-4-6"}
+	warmedAny := false
+	var lastErr error
+
+	for _, mod := range modelsToPing {
+		reqBody := map[string]any{
+			"model": mod,
+			"request": map[string]any{
+				"contents": []map[string]any{
+					{
+						"role": "user",
+						"parts": []map[string]string{
+							{"text": "1"},
+						},
+					},
+				},
+				"generationConfig": map[string]any{
+					"maxOutputTokens": 1,
+				},
+			},
+		}
+		if acc.ProjectID != "" {
+			reqBody["project"] = acc.ProjectID
+		}
+
+		raw, _ := json.Marshal(reqBody)
+		req, err := http.NewRequest("POST", "https://cloudcode-pa.googleapis.com/v1internal:generateContent", bytes.NewReader(raw))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "antigravity/1.107.0 (linux; x64)")
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusTooManyRequests {
+			warmedAny = true
+		} else {
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+	}
+
+	go m.FetchAndPushQuota(acc.Email)
+
+	if warmedAny {
+		applog.Printf("[warmup] successfully initiated 5hr limit timer for %s", acc.Email)
+		return &WarmupResult{Email: acc.Email, Success: true, Message: "5-hour limit timer started"}
+	}
+	return &WarmupResult{Email: acc.Email, Success: false, Message: fmt.Sprintf("warmup failed: %v", lastErr)}
+}
+
+func (m *Manager) WarmupAllAccounts() []WarmupResult {
+	accounts, err := m.db.GetActiveAccounts()
+	if err != nil || len(accounts) == 0 {
+		return nil
+	}
+
+	applog.Printf("[warmup] starting warmup for %d active accounts...", len(accounts))
+	results := make([]WarmupResult, 0, len(accounts))
+	for _, acc := range accounts {
+		res := m.WarmupAccount(acc)
+		if res != nil {
+			results = append(results, *res)
+		}
+	}
+	return results
 }

@@ -72,6 +72,14 @@
         "title": "AntiLoop: Add Account"
       },
       {
+        "command": "antiLoop.warmupAll",
+        "title": "AntiLoop: Warm Up All Accounts (Start 5h Limit)"
+      },
+      {
+        "command": "antiLoop.refreshAll",
+        "title": "AntiLoop: Refresh All Accounts"
+      },
+      {
         "command": "antiLoop.testLoginCommands",
         "title": "AntiLoop: Test Diagnostics"
       }

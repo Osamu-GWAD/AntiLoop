@@ -317,6 +317,18 @@ export async function activate(context: vscode.ExtensionContext) {
         log(`refreshAll error: ${err.message}`);
       }
     }),
+    vscode.commands.registerCommand('antiLoop.warmupAll', async () => {
+      vscode.window.showInformationMessage('AntiLoop: Warming up all accounts to start rolling 5-hour limit timer...');
+      try {
+        const res = await daemonClient?.send('warmupAccounts', {});
+        const count = res?.results?.filter((r: any) => r.success)?.length || 0;
+        const total = res?.results?.length || 0;
+        vscode.window.showInformationMessage(`AntiLoop: Warmed up ${count}/${total} accounts. 5-hour limit timers started!`);
+        accountsProvider?.refreshState();
+      } catch (err: any) {
+        vscode.window.showErrorMessage(`AntiLoop Warmup failed: ${err.message}`);
+      }
+    }),
     vscode.commands.registerCommand('antiLoop.testLoginCommands', async () => {
       try {
         const token = await getIdeToken();

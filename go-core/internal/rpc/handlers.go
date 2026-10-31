@@ -170,6 +170,7 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 			"networkEnhance": ctx.DB.GetSettingDefault("network_enhance", "true") == "true",
 			"maxRetries":     retries,
 			"activeFamily":   ctx.DB.GetSettingDefault("active_model_family", "claude"),
+			"autoWarmup":     ctx.DB.GetSettingDefault("auto_warmup", "false") == "true",
 			"quotaSettings": map[string]any{
 				"display": quotaDisplay,
 				"claude":  quotaClaude,
@@ -521,6 +522,23 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 	reg.RegisterHandler("pushCurrentToken", func(params json.RawMessage) (any, error) {
 		ctx.Rotation.PushCurrentToken()
 		return map[string]bool{"ok": true}, nil
+	})
+
+	reg.RegisterHandler("warmupAccounts", func(params json.RawMessage) (any, error) {
+		results := ctx.Rotation.WarmupAllAccounts()
+		return map[string]any{"ok": true, "results": results}, nil
+	})
+
+	reg.RegisterMutation("setAutoWarmup", func(params json.RawMessage) (any, error) {
+		var p struct {
+			Enabled bool `json:"enabled"`
+		}
+		_ = json.Unmarshal(params, &p)
+		_ = ctx.DB.SetSetting("auto_warmup", strconv.FormatBool(p.Enabled))
+		if p.Enabled {
+			go ctx.Rotation.WarmupAllAccounts()
+		}
+		return map[string]any{"ok": true, "autoWarmup": p.Enabled}, nil
 	})
 
 	reg.RegisterHandler("setProxyEnabled", func(params json.RawMessage) (any, error) {
