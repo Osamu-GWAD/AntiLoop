@@ -6,12 +6,6 @@ import { StatusBarManager } from './statusBar';
 import { AccountsViewProvider, getWebviewHtml } from './accountsViewProvider';
 import { getIdeToken, getIdeEmail, setIdeToken } from './tokenHelper';
 import { ActivateResult, StatusInfo } from './types';
-import {
-  linkObsidianVault,
-  unlinkObsidianVault,
-  showObsidianStatusDialog,
-  getObsidianStatus,
-} from './obsidianGrounding';
 
 let daemonClient: DaemonClient | null = null;
 let statusBar: StatusBarManager | null = null;
@@ -163,17 +157,6 @@ export async function activate(context: vscode.ExtensionContext) {
         const res = await daemonClient!.send('setAccountAlias', { id: params.id, alias });
         accountsProvider?.refreshState();
         return res;
-      }
-      if (method === 'linkObsidian') {
-        const vault = await linkObsidianVault(context);
-        return { ok: !!vault, vaultPath: vault };
-      }
-      if (method === 'unlinkObsidian') {
-        const ok = await unlinkObsidianVault(context);
-        return { ok };
-      }
-      if (method === 'getObsidianStatus') {
-        return getObsidianStatus(context);
       }
       return undefined;
     }
@@ -356,15 +339,6 @@ export async function activate(context: vscode.ExtensionContext) {
       } catch (err: any) {
         vscode.window.showErrorMessage(`AntiLoop Diagnostics Error: ${err.message}`);
       }
-    }),
-    vscode.commands.registerCommand('antiLoop.linkObsidian', async () => {
-      await linkObsidianVault(context);
-    }),
-    vscode.commands.registerCommand('antiLoop.unlinkObsidian', async () => {
-      await unlinkObsidianVault(context);
-    }),
-    vscode.commands.registerCommand('antiLoop.obsidianStatus', async () => {
-      await showObsidianStatusDialog(context);
     })
   );
 

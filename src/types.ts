@@ -15,6 +15,7 @@ export interface Account {
 export interface QuotaFamily {
   name: string;
   label: string;
+  family?: string;
   percent: number;
   remaining?: number;
   limit?: number;

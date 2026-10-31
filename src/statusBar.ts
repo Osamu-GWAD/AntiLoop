@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { QuotaData, QuotaFamily } from './types';
+import { QuotaData } from './types';
 
 export function formatProgressBar(percent: number): string {
   const filled = Math.round(Math.max(0, Math.min(100, percent)) / 10);
@@ -214,7 +214,7 @@ export class StatusBarManager {
     }
 
     const visibleFamilies = quota.families.filter((f) => {
-      const fam = (f.name || (f as any).family || f.label || '').toLowerCase();
+      const fam = (f.name || f.family || f.label || '').toLowerCase();
       if (fam.includes('claude')) return this.quotaSettings.claude;
       if (fam.includes('flash')) return this.quotaSettings.flash;
       if (fam.includes('pro')) return this.quotaSettings.pro;
