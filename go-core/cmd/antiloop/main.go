@@ -66,8 +66,10 @@ func main() {
 	remoteClient := remote.NewClient(db)
 
 	rotManager.SetCallbacks(
-		func(email string) {
-			daemonIPC.Notify("injectToken", map[string]string{"email": email})
+		func(info *rotation.TokenInfo) {
+			if info != nil {
+				daemonIPC.Notify("injectToken", info)
+			}
 		},
 		func(status any) {
 			daemonIPC.Notify("updateStatus", status)

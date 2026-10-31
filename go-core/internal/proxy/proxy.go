@@ -235,8 +235,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.router.IsActive() && isGenerationRequest(path) {
-		s.router.HandleRequest(w, r)
+	if s.router.IsActive() {
+		if isGenerationRequest(path) {
+			s.router.HandleRequest(w, r)
+			return
+		}
+		s.handleExternalMockDiscovery(w, r, path)
 		return
 	}
 
@@ -256,9 +260,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			token = strings.TrimSpace(token)
 			isPassThrough = true
 			applog.Printf("[proxy] using pass-through token from IDE (no active AntiLoop account)")
-		} else if s.router.IsActive() {
-			s.handleExternalMockDiscovery(w, r, path)
-			return
 		} else {
 			applog.Printf("[proxy] token error: %v (no pass-through Authorization available)", err)
 			http.Error(w, "No active account token", http.StatusUnauthorized)

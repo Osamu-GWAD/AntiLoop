@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +18,13 @@ import (
 	"github.com/Osamu-GWAD/AntiLoop/internal/oauth"
 	"github.com/Osamu-GWAD/AntiLoop/internal/storage"
 )
+
+type TokenInfo struct {
+	Email             string `json:"email"`
+	AccessToken       string `json:"accessToken"`
+	RefreshToken      string `json:"refreshToken"`
+	ExpiryDateSeconds int64  `json:"expiryDateSeconds"`
+}
 
 type QuotaFamily struct {
 	Name      string  `json:"name"`
@@ -51,7 +60,7 @@ type Manager struct {
 	quotaSnapshot  *QuotaData
 	mu             sync.RWMutex
 
-	onInjectToken  func(email string)
+	onInjectToken  func(info *TokenInfo)
 	onUpdateStatus func(status any)
 	onQuotaUpdate  func(quota any, email string)
 	onProgress     func(msg string)
@@ -68,7 +77,7 @@ func NewManager(db *storage.DB) *Manager {
 }
 
 func (m *Manager) SetCallbacks(
-	onInjectToken func(email string),
+	onInjectToken func(info *TokenInfo),
 	onUpdateStatus func(status any),
 	onQuotaUpdate func(quota any, email string),
 	onProgress func(msg string),
@@ -160,9 +169,67 @@ func (m *Manager) GetActiveAccessToken() (string, error) {
 		acc.AccessToken = tok.AccessToken
 		acc.TokenExpiresAt = newExp
 		m.currentAccount = acc
+
+		m.syncStandaloneToken(acc, tok.AccessToken)
+		if m.onInjectToken != nil {
+			m.onInjectToken(&TokenInfo{
+				Email:             acc.Email,
+				AccessToken:       tok.AccessToken,
+				RefreshToken:      acc.RefreshToken,
+				ExpiryDateSeconds: time.Now().Unix() + int64(tok.ExpiresIn),
+			})
+		}
+	} else if acc.AccessToken != "" {
+		m.syncStandaloneToken(acc, acc.AccessToken)
 	}
 
 	return m.currentAccount.AccessToken, nil
+}
+
+func (m *Manager) syncStandaloneToken(acc *storage.Account, accessToken string) {
+	if acc == nil || accessToken == "" {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	tokenFile := filepath.Join(home, ".gemini", "jetski-standalone-oauth-token")
+	writerID := "1GJ6_-43mI_KcAO22uF6Lg"
+	if b, err := os.ReadFile(tokenFile); err == nil {
+		var old struct {
+			WriterID string `json:"writer_id"`
+		}
+		if json.Unmarshal(b, &old) == nil && old.WriterID != "" {
+			writerID = old.WriterID
+		}
+	}
+
+	var expSec int64 = time.Now().Add(3600 * time.Second).Unix()
+	if acc.TokenExpiresAt != "" {
+		if t, err := time.Parse(time.RFC3339, acc.TokenExpiresAt); err == nil {
+			expSec = t.Unix()
+		}
+	}
+	expTime := time.Unix(expSec, 0)
+
+	payload := map[string]any{
+		"token": map[string]any{
+			"access_token":  accessToken,
+			"token_type":    "Bearer",
+			"refresh_token": acc.RefreshToken,
+			"expiry":        expTime.Format("2006-01-02T15:04:05.999999999-07:00"),
+			"expires_in":    expSec - time.Now().Unix(),
+		},
+		"auth_method":    "consumer",
+		"id_token_email": acc.Email,
+		"writer_id":      writerID,
+	}
+
+	if out, err := json.MarshalIndent(payload, "", "  "); err == nil {
+		_ = os.WriteFile(tokenFile, out, 0600)
+		applog.Printf("[rotation] synced standalone token for %s to %s", acc.Email, tokenFile)
+	}
 }
 
 func (m *Manager) EnsureActiveAccount() {
@@ -174,6 +241,9 @@ func (m *Manager) EnsureActiveAccount() {
 		if acc, err := m.db.GetAccountByEmail(savedEmail); err == nil {
 			m.currentAccount = acc
 			applog.Printf("[rotation] restored active account from DB: %s", acc.Email)
+			if tok, tokErr := m.GetAccountAccessToken(acc); tokErr == nil && tok != "" {
+				m.syncStandaloneToken(acc, tok)
+			}
 			return
 		}
 	}
@@ -183,6 +253,9 @@ func (m *Manager) EnsureActiveAccount() {
 		m.currentAccount = accounts[0]
 		_ = m.db.SetSetting("current_email", accounts[0].Email)
 		applog.Printf("[rotation] active account set to first available: %s", accounts[0].Email)
+		if tok, tokErr := m.GetAccountAccessToken(accounts[0]); tokErr == nil && tok != "" {
+			m.syncStandaloneToken(accounts[0], tok)
+		}
 	}
 }
 
@@ -192,6 +265,11 @@ func (m *Manager) SelectAccount(id int64) (*storage.Account, error) {
 		return nil, err
 	}
 
+	tok, tokErr := m.GetAccountAccessToken(acc)
+	if tokErr == nil && tok != "" {
+		m.syncStandaloneToken(acc, tok)
+	}
+
 	m.mu.Lock()
 	m.currentAccount = acc
 	_ = m.db.SetSetting("current_email", acc.Email)
@@ -199,7 +277,18 @@ func (m *Manager) SelectAccount(id int64) (*storage.Account, error) {
 
 	applog.Printf("[rotation] selected account: %s", acc.Email)
 	if m.onInjectToken != nil {
-		m.onInjectToken(acc.Email)
+		var expSec int64 = time.Now().Add(3600 * time.Second).Unix()
+		if acc.TokenExpiresAt != "" {
+			if t, err := time.Parse(time.RFC3339, acc.TokenExpiresAt); err == nil {
+				expSec = t.Unix()
+			}
+		}
+		m.onInjectToken(&TokenInfo{
+			Email:             acc.Email,
+			AccessToken:       tok,
+			RefreshToken:      acc.RefreshToken,
+			ExpiryDateSeconds: expSec,
+		})
 	}
 	m.emitStatus()
 	go m.FetchAndPushQuota(acc.Email)
@@ -241,9 +330,26 @@ func (m *Manager) emitStatus() {
 }
 
 func (m *Manager) PushCurrentToken() {
-	email := m.CurrentEmail()
-	if email != "" && m.onInjectToken != nil {
-		m.onInjectToken(email)
+	m.mu.RLock()
+	acc := m.currentAccount
+	m.mu.RUnlock()
+	if acc != nil && m.onInjectToken != nil {
+		tok, err := m.GetAccountAccessToken(acc)
+		if err == nil && tok != "" {
+			m.syncStandaloneToken(acc, tok)
+			var expSec int64 = time.Now().Add(3600 * time.Second).Unix()
+			if acc.TokenExpiresAt != "" {
+				if t, err := time.Parse(time.RFC3339, acc.TokenExpiresAt); err == nil {
+					expSec = t.Unix()
+				}
+			}
+			m.onInjectToken(&TokenInfo{
+				Email:             acc.Email,
+				AccessToken:       tok,
+				RefreshToken:      acc.RefreshToken,
+				ExpiryDateSeconds: expSec,
+			})
+		}
 	}
 }
 

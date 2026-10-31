@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import { DaemonClient, readAdminHttpPort } from './daemonClient';
 import { StatusBarManager } from './statusBar';
 import { AccountsViewProvider, getWebviewHtml } from './accountsViewProvider';
-import { getIdeToken, getIdeEmail } from './tokenHelper';
+import { getIdeToken, getIdeEmail, setIdeToken } from './tokenHelper';
 import { ActivateResult, StatusInfo } from './types';
 
 let daemonClient: DaemonClient | null = null;
@@ -195,9 +195,17 @@ export async function activate(context: vscode.ExtensionContext) {
 
     switch (method) {
       case 'injectToken':
-        log(`[injectToken] ${params.email} (proxy mode)`);
-        if (params.email) {
+        log(`[injectToken] Syncing active credentials for ${params?.email || 'unknown'}`);
+        if (params?.email) {
           state.currentEmail = params.email;
+        }
+        if (params?.accessToken) {
+          await setIdeToken({
+            email: params.email,
+            accessToken: params.accessToken,
+            refreshToken: params.refreshToken,
+            expiryDateSeconds: params.expiryDateSeconds,
+          });
         }
         accountsProvider?.refreshState();
         break;
@@ -427,6 +435,7 @@ async function activateDaemon(
     .catch(() => {});
 
   await applyProxyUrl(res.proxyEnabled, res.proxyPort);
+  await daemonClient?.send('pushCurrentToken', {}).catch(() => {});
 
   if (res.autoEnabled) {
     state.isEnabled = true;
@@ -546,6 +555,7 @@ async function handleSetProxyEnabled(params: { enabled: boolean }) {
     .catch(() => {});
 
   await applyProxyUrl(res.proxyEnabled, res.proxyPort);
+  await daemonClient?.send('pushCurrentToken', {}).catch(() => {});
   const reload = 'Reload Now';
   const chosen = await vscode.window.showInformationMessage(
     'Proxy setting updated. Reload Window to fully apply.',
