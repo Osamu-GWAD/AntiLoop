@@ -31,12 +31,12 @@ var (
 )
 
 const (
-	TokenEndpoint       = "https://oauth2.googleapis.com/token"
-	UserInfoEndpoint    = "https://www.googleapis.com/oauth2/v2/userinfo"
-	AuthEndpoint        = "https://accounts.google.com/o/oauth2/v2/auth"
-	LoadCodeAssistURL   = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
-	OnboardUserURL      = "https://cloudcode-pa.googleapis.com/v1internal:onboardUser"
-	FetchModelsURL      = "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+	TokenEndpoint     = "https://oauth2.googleapis.com/token"
+	UserInfoEndpoint  = "https://www.googleapis.com/oauth2/v2/userinfo"
+	AuthEndpoint      = "https://accounts.google.com/o/oauth2/v2/auth"
+	LoadCodeAssistURL = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+	OnboardUserURL    = "https://cloudcode-pa.googleapis.com/v1internal:onboardUser"
+	FetchModelsURL    = "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
 )
 
 var ScopesList = []string{
@@ -449,7 +449,8 @@ func FetchAvailableModels(accessToken, projectID string) (map[string]any, error)
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", fmt.Sprintf("antigravity/%s (%s)", currIdeVer, getPlatformString()))
+	version, _ := getIDEInfo()
+	req.Header.Set("User-Agent", fmt.Sprintf("antigravity/%s (%s)", version, getPlatformString()))
 
 	resp, err := httpClient.Do(req)
 	if err != nil {

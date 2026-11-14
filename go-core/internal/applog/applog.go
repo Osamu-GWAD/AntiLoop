@@ -2,7 +2,6 @@ package applog
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"sync"
@@ -28,8 +27,7 @@ func Init(logFilePath string, isDebug bool) error {
 		if err != nil {
 			return err
 		}
-		mw := io.MultiWriter(os.Stderr, f)
-		logger = log.New(mw, "", log.LstdFlags|log.Lmicroseconds)
+		logger = log.New(f, "", log.LstdFlags|log.Lmicroseconds)
 	}
 	return nil
 }

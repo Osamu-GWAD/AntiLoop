@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import { DaemonClient, readAdminHttpPort } from './daemonClient';
 import { StatusBarManager } from './statusBar';
 import { AccountsViewProvider, getWebviewHtml } from './accountsViewProvider';
-import { getIdeToken, getIdeEmail, setIdeToken } from './tokenHelper';
+import { getIdeToken, getIdeEmail, setIdeToken, waitForIdeTokenUpdate } from './tokenHelper';
 import { ActivateResult, StatusInfo } from './types';
 
 let daemonClient: DaemonClient | null = null;
@@ -16,6 +16,7 @@ let mainStoragePath = '';
 let adminPanelWebview: vscode.WebviewPanel | undefined;
 let signOutWatchTimer: NodeJS.Timeout | undefined;
 let wasSignOutNotified = false;
+let activeProviderRequest = 0;
 
 const state = {
   isEnabled: false,
@@ -55,7 +56,11 @@ export async function activate(context: vscode.ExtensionContext) {
   accountsProvider = new AccountsViewProvider(
     context.extensionUri,
     () => state.isBackendReady,
-    (method, params, timeoutMs) => daemonClient!.send(method, params, timeoutMs),
+    async (method, params, timeoutMs) => {
+      const result = await daemonClient!.send(method, params, timeoutMs);
+      if (method === 'selectAccount') await waitForIdeTokenUpdate();
+      return result;
+    },
     (webview) => getWebviewHtml(webview, context.extensionUri),
     async (action) => {
       if (action === 'enable') {
@@ -92,6 +97,7 @@ export async function activate(context: vscode.ExtensionContext) {
         return { ok: true };
       }
       if (
+        action === 'selectAccount' ||
         action === 'selectProvider' ||
         action === 'removeProvider' ||
         action === 'updateProvider' ||
@@ -200,12 +206,16 @@ export async function activate(context: vscode.ExtensionContext) {
           state.currentEmail = params.email;
         }
         if (params?.accessToken) {
-          await setIdeToken({
-            email: params.email,
-            accessToken: params.accessToken,
-            refreshToken: params.refreshToken,
-            expiryDateSeconds: params.expiryDateSeconds,
-          });
+          try {
+            await setIdeToken({
+              email: params.email,
+              accessToken: params.accessToken,
+              refreshToken: params.refreshToken,
+              expiryDateSeconds: params.expiryDateSeconds,
+            });
+          } catch (err: any) {
+            log(`[injectToken] IDE account update failed: ${err.message}`);
+          }
         }
         accountsProvider?.refreshState();
         break;
@@ -230,7 +240,9 @@ export async function activate(context: vscode.ExtensionContext) {
       case 'stateChanged':
         log(`[stateChanged] triggered by ${params?.trigger || 'unknown'}`);
         accountsProvider?.refreshState();
+        syncActiveProviderToStatusBar();
         daemonClient?.send('getStatus', {}).then((st: StatusInfo) => {
+          updateStatusFromDaemon(st);
           applyProxyUrl(st.proxyEnabled, st.proxyPort);
           if (st.quotaSettings) {
             statusBar?.setQuotaSettings(st.quotaSettings);
@@ -339,6 +351,36 @@ export async function activate(context: vscode.ExtensionContext) {
       } catch (err: any) {
         vscode.window.showErrorMessage(`AntiLoop Diagnostics Error: ${err.message}`);
       }
+    }),
+    vscode.commands.registerCommand('antigravity.handleAuthRefresh', async () => {
+      log('Handling antigravity.handleAuthRefresh event from IDE');
+      try {
+        const sync = (vscode as any).antigravityUnifiedStateSync;
+        await sync?.pushUpdate?.({
+          topicName: 'uss-oauth',
+          appliedUpdate: {
+            key: 'authStateWithContextSentinelKey',
+            newRow: {
+              value: JSON.stringify({
+                state: 'signedIn',
+                context: {
+                  project: '',
+                  showProjectError: false,
+                  errorMessage: '',
+                  ineligibleMessage: '',
+                  verificationUrl: '',
+                  isGcpTos: false,
+                  browserOpenFailed: false,
+                  appealUrl: '',
+                  appealLinkText: '',
+                },
+              }),
+              eTag: 0,
+            },
+          },
+        });
+      } catch {}
+      accountsProvider?.refreshState();
     })
   );
 
@@ -390,6 +432,7 @@ async function initDaemonLifecycle(context: vscode.ExtensionContext, storageDir:
   });
 
   daemonClient!.setOnDead(() => {
+    state.isBackendReady = false;
     log('Daemon connection permanently lost');
     statusBar?.showDead();
     vscode.window.showErrorMessage('AntiLoop: Lost connection to daemon after 5 retries.', 'Reconnect').then((sel) => {
@@ -408,6 +451,8 @@ async function activateDaemon(
   platform: string,
   isFirstInstall = false
 ) {
+  const initialIdeToken = await getIdeToken();
+  const initialIdeEmail = await getIdeEmail(initialIdeToken);
   let mtime = 0;
   try {
     const binPath = daemonClient!.getBinaryPath();
@@ -468,9 +513,9 @@ async function activateDaemon(
 
   const tryImport = async (attempt: number) => {
     try {
-      const token = await getIdeToken();
+      const token = initialIdeToken || await getIdeToken();
       if (token?.accessToken && token?.refreshToken && !token.refreshToken.startsWith('MOCK_TOKEN_')) {
-        const email = await getIdeEmail();
+        const email = initialIdeEmail || await getIdeEmail(token);
         if (email) {
           const importRes = await daemonClient!.send('importIdeAccount', {
             email,
@@ -598,8 +643,10 @@ function updateStatusFromDaemon(status: any) {
 
 async function syncActiveProviderToStatusBar() {
   if (!daemonClient || !statusBar) return;
+  const request = ++activeProviderRequest;
   try {
     const res = await daemonClient.send('listProviders');
+    if (request !== activeProviderRequest) return;
     const activeId = res?.activeProviderID;
     if (activeId && res?.providers) {
       const active = res.providers.find((p: any) => p.id === activeId);
@@ -691,7 +738,9 @@ function openAdminPanelWebview(context: vscode.ExtensionContext) {
         adminPanelWebview?.webview.postMessage({ type: 'response', id: msg.id, result: res });
         return;
       }
-      const res = await daemonClient!.send(msg.method, msg.params);
+      const timeout = msg.method === 'addAccount' || msg.method === 'warmupAccounts' ? 300000 : undefined;
+      const res = await daemonClient!.send(msg.method, msg.params, timeout);
+      if (msg.method === 'selectAccount') await waitForIdeTokenUpdate();
       adminPanelWebview?.webview.postMessage({ type: 'response', id: msg.id, result: res });
       accountsProvider?.refreshState();
     } catch (err: any) {
@@ -709,10 +758,5 @@ export async function deactivate() {
     clearInterval(signOutWatchTimer);
     signOutWatchTimer = undefined;
   }
-  try {
-    await vscode.workspace
-      .getConfiguration('jetski')
-      .update('cloudCodeUrl', undefined, vscode.ConfigurationTarget.Global);
-  } catch {}
   daemonClient?.dispose();
 }

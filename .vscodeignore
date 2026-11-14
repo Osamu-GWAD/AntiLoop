@@ -7,6 +7,7 @@ src/**
 *.map
 vsc-extension-quickstart.md
 scripts/**
+tests/**
 go-core/cmd/**
 go-core/internal/**
 go-core/go.mod

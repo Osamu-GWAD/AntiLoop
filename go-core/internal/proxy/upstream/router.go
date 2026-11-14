@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Osamu-GWAD/AntiLoop/internal/applog"
@@ -15,6 +16,7 @@ import (
 )
 
 type Router struct {
+	mu             sync.RWMutex
 	activeProvider *storage.Provider
 	client         *http.Client
 }
@@ -28,18 +30,31 @@ func NewRouter() *Router {
 }
 
 func (r *Router) SetActiveProvider(p *storage.Provider) {
-	r.activeProvider = p
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if p == nil {
+		r.activeProvider = nil
+		return
+	}
+	copy := *p
+	r.activeProvider = &copy
 }
 
 func (r *Router) ActiveProvider() *storage.Provider {
-	return r.activeProvider
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.activeProvider == nil {
+		return nil
+	}
+	copy := *r.activeProvider
+	return &copy
 }
 
 func (r *Router) IsActive() bool {
 	if r == nil {
 		return false
 	}
-	p := r.activeProvider
+	p := r.ActiveProvider()
 	return p != nil && p.BaseURL != "" && p.ModelID != ""
 }
 
@@ -87,17 +102,22 @@ func ParseGeminiBody(body []byte) (*ParsedGeminiRequest, error) {
 	}
 
 	if err := json.Unmarshal(body, &gReq); err != nil {
-		// Fallback: check if it is already OpenAI messages format
-		var oaiReq struct {
-			Messages []map[string]string `json:"messages"`
-		}
-		if oaiErr := json.Unmarshal(body, &oaiReq); oaiErr == nil && len(oaiReq.Messages) > 0 {
-			return &ParsedGeminiRequest{
-				Messages: oaiReq.Messages,
-				IsStream: true,
-			}, nil
-		}
 		return nil, err
+	}
+	if len(gReq.Contents) == 0 && len(gReq.Request.Contents) == 0 {
+		var oaiReq struct {
+			Messages    []map[string]string `json:"messages"`
+			Temperature float64             `json:"temperature"`
+			MaxTokens   int                 `json:"max_tokens"`
+		}
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			return nil, err
+		}
+		if len(oaiReq.Messages) == 0 {
+			return nil, fmt.Errorf("request contains no messages or contents")
+		}
+		return &ParsedGeminiRequest{Messages: oaiReq.Messages, Temperature: oaiReq.Temperature,
+			MaxOutputTokens: oaiReq.MaxTokens, IsStream: true}, nil
 	}
 
 	contents := gReq.Contents
@@ -153,7 +173,7 @@ func ParseGeminiBody(body []byte) (*ParsedGeminiRequest, error) {
 }
 
 func (r *Router) HandleRequest(w http.ResponseWriter, req *http.Request) {
-	p := r.activeProvider
+	p := r.ActiveProvider()
 	if p == nil || p.BaseURL == "" || p.ModelID == "" {
 		http.Error(w, "No active third-party provider configured", http.StatusBadGateway)
 		return

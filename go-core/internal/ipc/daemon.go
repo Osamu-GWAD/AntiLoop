@@ -138,6 +138,19 @@ func (d *Daemon) handleClient(client *Client) {
 		d.clientsMu.Unlock()
 	}()
 
+	mutations := make(chan *Request, 64)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case req := <-mutations:
+				d.dispatchMessage(client, req)
+			}
+		}
+	}()
 	reader := bufio.NewReader(client.conn)
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -158,7 +171,15 @@ func (d *Daemon) handleClient(client *Client) {
 			continue
 		}
 
-		d.dispatchMessage(client, &req)
+		if _, mutation := d.mutations[req.Method]; mutation {
+			select {
+			case mutations <- &req:
+			case <-done:
+				return
+			}
+		} else {
+			go d.dispatchMessage(client, &req)
+		}
 	}
 }
 

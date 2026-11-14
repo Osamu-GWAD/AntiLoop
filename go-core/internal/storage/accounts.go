@@ -67,7 +67,7 @@ func (d *DB) ListAccounts() ([]*Account, error) {
 		a.RefreshToken, _ = d.Decrypt(encRefresh)
 		accounts = append(accounts, &a)
 	}
-	return accounts, nil
+	return accounts, rows.Err()
 }
 
 func (d *DB) GetActiveAccounts() ([]*Account, error) {
@@ -88,6 +88,10 @@ func (d *DB) GetAccount(id int64) (*Account, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
+	return d.getAccount(id)
+}
+
+func (d *DB) getAccount(id int64) (*Account, error) {
 	var a Account
 	var encAccess, encRefresh string
 	var useCredits int
@@ -167,36 +171,21 @@ func (d *DB) AddAccount(email, refreshToken, status, tier string, sortOrder int)
 		sortOrder = maxOrder
 	}
 
-	res, err := d.db.Exec(`
+	var id int64
+	err = d.db.QueryRow(`
 		INSERT INTO accounts (email, refresh_token, status, tier, sort_order, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(email) DO UPDATE SET
 			refresh_token = excluded.refresh_token,
 			status = excluded.status,
 			updated_at = excluded.updated_at
-	`, email, encRefresh, status, tier, sortOrder, now, now)
+		RETURNING id
+	`, email, encRefresh, status, tier, sortOrder, now, now).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
 
-	id, _ := res.LastInsertId()
-	if id == 0 {
-
-		var existingId int64
-		_ = d.db.QueryRow("SELECT id FROM accounts WHERE email = ?", email).Scan(&existingId)
-		id = existingId
-	}
-
-	return &Account{
-		ID:           id,
-		Email:        email,
-		Status:       status,
-		Tier:         tier,
-		RefreshToken: refreshToken,
-		SortOrder:    sortOrder,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-	}, nil
+	return d.getAccount(id)
 }
 
 func (d *DB) UpdateAccountToken(id int64, accessToken, expiresAt string) error {
@@ -215,6 +204,30 @@ func (d *DB) UpdateAccountToken(id int64, accessToken, expiresAt string) error {
 		WHERE id = ?
 	`, encAccess, expiresAt, now, id)
 	return err
+}
+
+func (d *DB) UpdateAccountCredentials(id int64, accessToken, refreshToken, expiresAt string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	access, err := d.Encrypt(accessToken)
+	if err != nil {
+		return err
+	}
+	refresh, err := d.Encrypt(refreshToken)
+	if err != nil {
+		return err
+	}
+	result, err := d.db.Exec(`UPDATE accounts SET access_token = ?, refresh_token = ?, token_expires_at = ?, updated_at = ? WHERE id = ?`,
+		access, refresh, expiresAt, time.Now().UTC().Format(time.RFC3339), id)
+	if err != nil {
+		return err
+	}
+	if count, err := result.RowsAffected(); err != nil {
+		return err
+	} else if count == 0 {
+		return ErrAccountNotFound
+	}
+	return nil
 }
 
 func (d *DB) UpdateAccountTier(id int64, tier string) error {

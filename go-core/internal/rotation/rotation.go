@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -60,12 +61,18 @@ type QuotaData struct {
 }
 
 type Manager struct {
-	db             *storage.DB
-	currentAccount *storage.Account
-	activeSource   string
-	enabled        bool
-	quotaSnapshot  *QuotaData
-	mu             sync.RWMutex
+	db               *storage.DB
+	currentAccount   *storage.Account
+	activeSource     string
+	enabled          bool
+	quotaSnapshot    *QuotaData
+	selectionVersion uint64
+	mu               sync.RWMutex
+	switchMu         sync.Mutex
+	tokenLocks       sync.Map
+	refreshToken     func(string) (*oauth.TokenResponse, error)
+	fetchModels      func(string, string) (map[string]any, error)
+	unavailableUntil map[int64]time.Time
 
 	onInjectToken  func(info *TokenInfo)
 	onUpdateStatus func(status any)
@@ -77,9 +84,12 @@ type Manager struct {
 
 func NewManager(db *storage.DB) *Manager {
 	return &Manager{
-		db:           db,
-		activeSource: "local",
-		stopWatch:    make(chan struct{}),
+		db:               db,
+		activeSource:     "local",
+		stopWatch:        make(chan struct{}),
+		refreshToken:     oauth.RefreshAccessToken,
+		fetchModels:      oauth.FetchAvailableModels,
+		unavailableUntil: make(map[int64]time.Time),
 	}
 }
 
@@ -143,54 +153,49 @@ func (m *Manager) CurrentUseAICredits() bool {
 	return false
 }
 
+var ErrNoActiveAccount = errors.New("no active account")
+
 func (m *Manager) GetActiveAccessToken() (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	_, token, err := m.GetActiveAccountToken()
+	return token, err
+}
 
-	if m.currentAccount == nil {
-		return "", fmt.Errorf("no active account")
-	}
-
-	acc, err := m.db.GetAccount(m.currentAccount.ID)
-	if err != nil {
-		return "", err
-	}
-	m.currentAccount = acc
-
-	var expSec int64
-	if acc.TokenExpiresAt != "" {
-		if t, err := time.Parse(time.RFC3339, acc.TokenExpiresAt); err == nil {
-			expSec = t.Unix()
+// GetActiveAccountToken keeps the credentials and account metadata from the same selection.
+func (m *Manager) GetActiveAccountToken() (*storage.Account, string, error) {
+	for {
+		m.mu.RLock()
+		if m.currentAccount == nil {
+			m.mu.RUnlock()
+			return nil, "", ErrNoActiveAccount
 		}
-	}
-
-	now := time.Now().Unix()
-	if expSec <= now+60 && acc.RefreshToken != "" {
-		applog.Printf("[rotation] refreshing expired token for %s", acc.Email)
-		tok, err := oauth.RefreshAccessToken(acc.RefreshToken)
+		acc := *m.currentAccount
+		version := m.selectionVersion
+		m.mu.RUnlock()
+		previousToken := acc.AccessToken
+		token, err := m.GetAccountAccessToken(&acc)
+		m.switchMu.Lock()
+		if m.CurrentAccountID() != acc.ID || m.selectionVersion != version {
+			m.switchMu.Unlock()
+			continue
+		}
 		if err != nil {
-			return "", fmt.Errorf("refresh token for %s: %w", acc.Email, err)
+			m.switchMu.Unlock()
+			return &acc, "", err
 		}
-		newExp := time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).UTC().Format(time.RFC3339)
-		_ = m.db.UpdateAccountToken(acc.ID, tok.AccessToken, newExp)
-		acc.AccessToken = tok.AccessToken
-		acc.TokenExpiresAt = newExp
-		m.currentAccount = acc
-
-		m.syncStandaloneToken(acc, tok.AccessToken)
-		if m.onInjectToken != nil {
-			m.onInjectToken(&TokenInfo{
-				Email:             acc.Email,
-				AccessToken:       tok.AccessToken,
-				RefreshToken:      acc.RefreshToken,
-				ExpiryDateSeconds: time.Now().Unix() + int64(tok.ExpiresIn),
-			})
+		if !accountEnabled(&acc) {
+			m.switchMu.Unlock()
+			return &acc, "", fmt.Errorf("account %s is excluded", acc.Email)
 		}
-	} else if acc.AccessToken != "" {
-		m.syncStandaloneToken(acc, acc.AccessToken)
+		m.mu.Lock()
+		current := acc
+		m.currentAccount = &current
+		m.mu.Unlock()
+		if token != previousToken {
+			m.pushToken(&acc)
+		}
+		m.switchMu.Unlock()
+		return &acc, token, nil
 	}
-
-	return m.currentAccount.AccessToken, nil
 }
 
 func (m *Manager) syncStandaloneToken(acc *storage.Account, accessToken string) {
@@ -233,79 +238,131 @@ func (m *Manager) syncStandaloneToken(acc *storage.Account, accessToken string) 
 		"writer_id":      writerID,
 	}
 
-	if out, err := json.MarshalIndent(payload, "", "  "); err == nil {
-		_ = os.WriteFile(tokenFile, out, 0600)
-		applog.Printf("[rotation] synced standalone token for %s to %s", acc.Email, tokenFile)
+	out, err := json.MarshalIndent(payload, "", "  ")
+	if err == nil {
+		err = os.MkdirAll(filepath.Dir(tokenFile), 0700)
+	}
+	if err == nil {
+		var tmp *os.File
+		tmp, err = os.CreateTemp(filepath.Dir(tokenFile), ".antiloop-token-*")
+		if err == nil {
+			defer os.Remove(tmp.Name())
+			_, err = tmp.Write(out)
+			closeErr := tmp.Close()
+			if err == nil {
+				err = closeErr
+			}
+			if err == nil {
+				err = os.Rename(tmp.Name(), tokenFile)
+			}
+		}
+	}
+	if err != nil {
+		applog.Printf("[rotation] standalone token sync failed: %v", err)
 	}
 }
 
-func (m *Manager) EnsureActiveAccount() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func accountEnabled(acc *storage.Account) bool {
+	return acc != nil && (acc.Status == "active" || acc.Status == "included")
+}
 
-	savedEmail, _ := m.db.GetSetting("current_email")
-	if savedEmail != "" {
-		if acc, err := m.db.GetAccountByEmail(savedEmail); err == nil {
-			m.currentAccount = acc
-			applog.Printf("[rotation] restored active account from DB: %s", acc.Email)
-			if tok, tokErr := m.GetAccountAccessToken(acc); tokErr == nil && tok != "" {
-				m.syncStandaloneToken(acc, tok)
-			}
+func (m *Manager) EnsureActiveAccount() {
+	m.switchMu.Lock()
+	defer m.switchMu.Unlock()
+	accounts, err := m.db.GetActiveAccounts()
+	if err != nil {
+		return
+	}
+	saved := m.db.GetSettingDefault("current_email", "")
+	for i, acc := range accounts {
+		if acc.Email == saved {
+			accounts[0], accounts[i] = accounts[i], accounts[0]
+			break
+		}
+	}
+	for _, acc := range accounts {
+		if _, err := m.selectAccount(acc.ID); err == nil {
 			if m.db.GetSettingDefault("auto_warmup", "false") == "true" {
 				go m.WarmupAllAccounts()
 			}
 			return
 		}
 	}
-
-	accounts, err := m.db.GetActiveAccounts()
-	if err == nil && len(accounts) > 0 {
-		m.currentAccount = accounts[0]
-		_ = m.db.SetSetting("current_email", accounts[0].Email)
-		applog.Printf("[rotation] active account set to first available: %s", accounts[0].Email)
-		if tok, tokErr := m.GetAccountAccessToken(accounts[0]); tokErr == nil && tok != "" {
-			m.syncStandaloneToken(accounts[0], tok)
-		}
-		if m.db.GetSettingDefault("auto_warmup", "false") == "true" {
-			go m.WarmupAllAccounts()
-		}
-	}
+	m.mu.Lock()
+	m.currentAccount = nil
+	m.selectionVersion++
+	m.quotaSnapshot = nil
+	m.mu.Unlock()
+	_ = m.db.SetSetting("current_email", "")
+	m.emitStatus()
 }
 
 func (m *Manager) SelectAccount(id int64) (*storage.Account, error) {
+	m.switchMu.Lock()
+	defer m.switchMu.Unlock()
+	return m.selectAccount(id)
+}
+
+// selectAccount runs with switchMu held so credential notifications follow selection order.
+func (m *Manager) selectAccount(id int64) (*storage.Account, error) {
 	acc, err := m.db.GetAccount(id)
 	if err != nil {
 		return nil, err
 	}
-
-	tok, tokErr := m.GetAccountAccessToken(acc)
-	if tokErr == nil && tok != "" {
-		m.syncStandaloneToken(acc, tok)
+	if !accountEnabled(acc) {
+		return nil, fmt.Errorf("account %s is excluded", acc.Email)
 	}
-
+	if _, err := m.GetAccountAccessToken(acc); err != nil {
+		return nil, err
+	}
+	if err := m.db.SetSetting("current_email", acc.Email); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
-	m.currentAccount = acc
-	_ = m.db.SetSetting("current_email", acc.Email)
+	current := *acc
+	m.currentAccount = &current
+	m.selectionVersion++
+	m.quotaSnapshot = quotaFromAccount(acc)
 	m.mu.Unlock()
-
-	applog.Printf("[rotation] selected account: %s", acc.Email)
-	if m.onInjectToken != nil {
-		var expSec int64 = time.Now().Add(3600 * time.Second).Unix()
-		if acc.TokenExpiresAt != "" {
-			if t, err := time.Parse(time.RFC3339, acc.TokenExpiresAt); err == nil {
-				expSec = t.Unix()
-			}
-		}
-		m.onInjectToken(&TokenInfo{
-			Email:             acc.Email,
-			AccessToken:       tok,
-			RefreshToken:      acc.RefreshToken,
-			ExpiryDateSeconds: expSec,
-		})
-	}
+	m.pushToken(acc)
 	m.emitStatus()
 	go m.FetchAndPushQuota(acc.Email)
 	return acc, nil
+}
+
+func (m *Manager) pushToken(acc *storage.Account) {
+	m.syncStandaloneToken(acc, acc.AccessToken)
+	if m.onInjectToken != nil {
+		exp, _ := time.Parse(time.RFC3339, acc.TokenExpiresAt)
+		m.onInjectToken(&TokenInfo{Email: acc.Email, AccessToken: acc.AccessToken,
+			RefreshToken: acc.RefreshToken, ExpiryDateSeconds: exp.Unix()})
+	}
+}
+
+func quotaFromAccount(acc *storage.Account) *QuotaData {
+	if acc == nil || acc.ModelsJSON == "" {
+		return nil
+	}
+	if fetched, err := time.Parse(time.RFC3339, acc.ModelsFetchedAt); err == nil && time.Since(fetched) > 5*time.Minute {
+		return nil
+	}
+	raw := []byte(acc.ModelsJSON)
+	if len(raw) >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+		r, err := gzip.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			return nil
+		}
+		defer r.Close()
+		raw, err = io.ReadAll(r)
+		if err != nil {
+			return nil
+		}
+	}
+	var data map[string]any
+	if json.Unmarshal(raw, &data) != nil {
+		return nil
+	}
+	return ParseQuota(data)
 }
 
 func (m *Manager) Enable() {
@@ -329,49 +386,44 @@ func (m *Manager) Disable() {
 }
 
 func (m *Manager) emitStatus() {
-	if m.onUpdateStatus != nil {
-		m.mu.RLock()
-		st := map[string]any{
-			"enabled":      m.enabled,
-			"currentEmail": m.CurrentEmail(),
-			"currentTier":  m.CurrentTier(),
-			"activeSource": m.activeSource,
-		}
-		m.mu.RUnlock()
-		m.onUpdateStatus(st)
+	if m.onUpdateStatus == nil {
+		return
 	}
+	m.mu.RLock()
+	email, tier := "", ""
+	if m.currentAccount != nil {
+		email, tier = m.currentAccount.Email, m.currentAccount.Tier
+	}
+	st := map[string]any{"enabled": m.enabled, "currentEmail": email,
+		"currentTier": tier, "activeSource": m.activeSource}
+	m.mu.RUnlock()
+	m.onUpdateStatus(st)
 }
 
 func (m *Manager) PushCurrentToken() {
+	acc, _, err := m.GetActiveAccountToken()
+	if err != nil {
+		return
+	}
+	m.switchMu.Lock()
+	defer m.switchMu.Unlock()
 	m.mu.RLock()
-	acc := m.currentAccount
+	current := m.currentAccount
+	matches := current != nil && current.ID == acc.ID && current.AccessToken == acc.AccessToken
 	m.mu.RUnlock()
-	if acc != nil && m.onInjectToken != nil {
-		tok, err := m.GetAccountAccessToken(acc)
-		if err == nil && tok != "" {
-			m.syncStandaloneToken(acc, tok)
-			var expSec int64 = time.Now().Add(3600 * time.Second).Unix()
-			if acc.TokenExpiresAt != "" {
-				if t, err := time.Parse(time.RFC3339, acc.TokenExpiresAt); err == nil {
-					expSec = t.Unix()
-				}
-			}
-			m.onInjectToken(&TokenInfo{
-				Email:             acc.Email,
-				AccessToken:       tok,
-				RefreshToken:      acc.RefreshToken,
-				ExpiryDateSeconds: expSec,
-			})
-		}
+	if matches {
+		m.pushToken(acc)
 	}
 }
 
 func (m *Manager) PushCurrentQuota() {
 	m.mu.RLock()
 	q := m.quotaSnapshot
-	email := m.CurrentEmail()
+	email := ""
+	if m.currentAccount != nil {
+		email = m.currentAccount.Email
+	}
 	m.mu.RUnlock()
-
 	if q != nil && m.onQuotaUpdate != nil {
 		m.onQuotaUpdate(q, email)
 	}
@@ -381,31 +433,33 @@ func (m *Manager) GetAccountAccessToken(acc *storage.Account) (string, error) {
 	if acc == nil {
 		return "", fmt.Errorf("account is nil")
 	}
-
-	var expSec int64
-	if acc.TokenExpiresAt != "" {
-		if t, err := time.Parse(time.RFC3339, acc.TokenExpiresAt); err == nil {
-			expSec = t.Unix()
-		}
+	lock, _ := m.tokenLocks.LoadOrStore(acc.ID, &sync.Mutex{})
+	lock.(*sync.Mutex).Lock()
+	defer lock.(*sync.Mutex).Unlock()
+	fresh, err := m.db.GetAccount(acc.ID)
+	if err != nil {
+		return "", err
 	}
-
-	now := time.Now().Unix()
-	if (expSec <= now+60 || acc.AccessToken == "") && acc.RefreshToken != "" {
-		applog.Printf("[rotation] refreshing expired token for %s", acc.Email)
-		tok, err := oauth.RefreshAccessToken(acc.RefreshToken)
-		if err != nil {
-			applog.Printf("[rotation] token refresh failed for %s: %v", acc.Email, err)
-			if acc.AccessToken != "" {
-				return acc.AccessToken, nil
-			}
-			return "", err
-		}
-		newExp := time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).UTC().Format(time.RFC3339)
-		acc.AccessToken = tok.AccessToken
-		acc.TokenExpiresAt = newExp
-		_ = m.db.UpdateAccountToken(acc.ID, tok.AccessToken, newExp)
+	*acc = *fresh
+	exp, _ := time.Parse(time.RFC3339, acc.TokenExpiresAt)
+	if acc.AccessToken != "" && exp.After(time.Now().Add(time.Minute)) {
+		return acc.AccessToken, nil
 	}
-
+	if acc.RefreshToken == "" {
+		return "", fmt.Errorf("account %s has no usable credentials", acc.Email)
+	}
+	tok, err := m.refreshToken(acc.RefreshToken)
+	if err != nil {
+		return "", fmt.Errorf("refresh token for %s: %w", acc.Email, err)
+	}
+	if tok == nil || tok.AccessToken == "" || tok.ExpiresIn <= 0 {
+		return "", fmt.Errorf("empty or expired token for %s", acc.Email)
+	}
+	newExp := time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).UTC().Format(time.RFC3339)
+	if err := m.db.UpdateAccountToken(acc.ID, tok.AccessToken, newExp); err != nil {
+		return "", err
+	}
+	acc.AccessToken, acc.TokenExpiresAt = tok.AccessToken, newExp
 	return acc.AccessToken, nil
 }
 
@@ -416,7 +470,10 @@ func (m *Manager) FetchAndPushQuota(email string) {
 		acc, err = m.db.GetAccountByEmail(email)
 	} else {
 		m.mu.RLock()
-		acc = m.currentAccount
+		if m.currentAccount != nil {
+			copy := *m.currentAccount
+			acc = &copy
+		}
 		m.mu.RUnlock()
 	}
 	if err != nil || acc == nil {
@@ -429,7 +486,7 @@ func (m *Manager) FetchAndPushQuota(email string) {
 		return
 	}
 
-	data, err := oauth.FetchAvailableModels(tok, acc.ProjectID)
+	data, err := m.fetchModels(tok, acc.ProjectID)
 	if err != nil {
 		applog.Printf("[rotation] fetch quota error for %s: %v", acc.Email, err)
 		return
@@ -448,7 +505,7 @@ func (m *Manager) FetchAndPushQuota(email string) {
 	if m.onQuotaUpdate != nil {
 		m.onQuotaUpdate(quota, acc.Email)
 	}
-	if m.IsEnabled() && m.currentAccount != nil && m.currentAccount.Email == acc.Email {
+	if m.IsEnabled() && m.CurrentEmail() == acc.Email {
 		m.checkAutoRotation()
 	}
 }
@@ -485,7 +542,7 @@ func (m *Manager) UpdateAccountModelsJSON(email, modelsJSON string) {
 		if m.onQuotaUpdate != nil {
 			m.onQuotaUpdate(quota, email)
 		}
-		if m.IsEnabled() && m.currentAccount != nil && m.currentAccount.Email == email {
+		if m.IsEnabled() && m.CurrentEmail() == email {
 			m.checkAutoRotation()
 		}
 	}
@@ -522,9 +579,20 @@ func ParseQuota(data map[string]any) *QuotaData {
 			}
 		}
 	} else if mMap, ok := data["models"].(map[string]any); ok {
-		for _, item := range mMap {
+		for k, item := range mMap {
 			if subMap, ok := item.(map[string]any); ok {
-				rawModels = append(rawModels, subMap)
+				mCopy := make(map[string]any, len(subMap)+2)
+				for sk, sv := range subMap {
+					mCopy[sk] = sv
+				}
+				mCopy["_modelId"] = k
+				if name, _ := mCopy["name"].(string); name == "" {
+					mCopy["name"] = k
+				}
+				if dn, _ := mCopy["displayName"].(string); dn == "" {
+					mCopy["displayName"] = k
+				}
+				rawModels = append(rawModels, mCopy)
 			}
 		}
 	}
@@ -538,12 +606,18 @@ func ParseQuota(data map[string]any) *QuotaData {
 	var modelItems []ModelItem
 
 	for _, mMap := range rawModels {
+		modelId, _ := mMap["_modelId"].(string)
 		name, _ := mMap["name"].(string)
 		displayName, _ := mMap["displayName"].(string)
+		modelVal, _ := mMap["model"].(string)
 		if displayName == "" {
-			displayName = name
+			if name != "" {
+				displayName = name
+			} else if modelId != "" {
+				displayName = modelId
+			}
 		}
-		lower := strings.ToLower(name + " " + displayName)
+		lower := strings.ToLower(modelId + " " + name + " " + displayName + " " + modelVal)
 
 		quotaInfo, _ := mMap["quotaInfo"].(map[string]any)
 		if quotaInfo == nil {
@@ -563,6 +637,15 @@ func ParseQuota(data map[string]any) *QuotaData {
 			percent = remFrac * 100.0
 		} else if limit > 0 {
 			percent = (remaining / limit) * 100.0
+		} else if resetTime != "" {
+			// In Proto3 JSON, default numeric values (0.0) are omitted.
+			// When remainingFraction is omitted but resetTime is present, the quota is 0%.
+			percent = 0.0
+		}
+		if percent < 0 {
+			percent = 0
+		} else if percent > 100 {
+			percent = 100
 		}
 		percent = math.Round(percent)
 
@@ -574,6 +657,11 @@ func ParseQuota(data map[string]any) *QuotaData {
 			RemainingFraction: percent / 100.0,
 			ResetTime:         resetTime,
 		})
+
+		// Skip tab autocomplete background models from driving the main chat/agent quota families
+		if strings.HasPrefix(modelId, "tab_") {
+			continue
+		}
 
 		if strings.Contains(lower, "claude") {
 			if claudeFamily == nil || percent < claudeFamily.Percent {
@@ -653,67 +741,90 @@ func (m *Manager) RunQuotaWatch() {
 	}
 }
 
-func (m *Manager) checkAutoRotation() {
-	m.mu.RLock()
-	q := m.quotaSnapshot
-	thresholdStr := m.db.GetSettingDefault("quota_threshold", "10")
-	benchmark := m.db.GetSettingDefault("active_model_family", "claude")
-	m.mu.RUnlock()
-
-	if q == nil || len(q.Families) == 0 {
-		return
+func quotaLow(q *QuotaData, benchmark string, threshold float64) bool {
+	if q == nil {
+		return false
 	}
-
-	threshold, err := strconv.ParseFloat(thresholdStr, 64)
-	if err != nil || threshold < 0 {
-		threshold = 10
-	}
-
-	low := false
-	benchmarkFound := false
 	for _, f := range q.Families {
 		if strings.EqualFold(f.Name, benchmark) {
-			benchmarkFound = true
-			if f.Percent <= threshold {
-				low = true
+			if reset, err := time.Parse(time.RFC3339, f.ResetTime); err == nil && reset.Before(time.Now()) {
+				return false
 			}
-			break
+			return f.Percent <= threshold
 		}
 	}
-	if !benchmarkFound {
-		for _, f := range q.Families {
-			if f.Percent <= threshold {
-				low = true
-				break
+	for _, f := range q.Families {
+		if f.Percent <= threshold {
+			if reset, err := time.Parse(time.RFC3339, f.ResetTime); err == nil && reset.Before(time.Now()) {
+				continue
 			}
+			return true
 		}
 	}
+	return false
+}
 
-	if low {
-		applog.Printf("[rotation] %s quota below or at threshold (%.1f%%) — rotating account", benchmark, threshold)
-		m.RotateToNextAccount()
+func (m *Manager) rotationSettings() (string, float64) {
+	threshold, err := strconv.ParseFloat(m.db.GetSettingDefault("quota_threshold", "10"), 64)
+	if err != nil || threshold < 0 || threshold > 100 {
+		threshold = 10
+	}
+	return m.db.GetSettingDefault("active_model_family", "claude"), threshold
+}
+
+func (m *Manager) checkAutoRotation() {
+	m.mu.RLock()
+	q, enabled := m.quotaSnapshot, m.enabled
+	var id int64
+	if m.currentAccount != nil {
+		id = m.currentAccount.ID
+	}
+	m.mu.RUnlock()
+	benchmark, threshold := m.rotationSettings()
+	if enabled && quotaLow(q, benchmark, threshold) {
+		m.RotateIfCurrent(id, false)
 	}
 }
 
 func (m *Manager) RotateToNextAccount() {
-	accounts, err := m.db.GetActiveAccounts()
-	if err != nil || len(accounts) <= 1 {
-		return
-	}
+	m.RotateIfCurrent(m.CurrentAccountID(), false)
+}
 
-	currID := m.CurrentAccountID()
-	var next *storage.Account
-	for i, a := range accounts {
-		if a.ID == currID {
-			next = accounts[(i+1)%len(accounts)]
+// RotateIfCurrent prevents late failures from rotating an account selected by another request.
+func (m *Manager) RotateIfCurrent(id int64, rateLimited bool) bool {
+	m.switchMu.Lock()
+	defer m.switchMu.Unlock()
+	if m.CurrentAccountID() != id {
+		return true
+	}
+	if !m.IsEnabled() {
+		return false
+	}
+	if rateLimited {
+		m.unavailableUntil[id] = time.Now().Add(time.Minute)
+	}
+	accounts, err := m.db.GetActiveAccounts()
+	if err != nil || len(accounts) < 2 {
+		return false
+	}
+	benchmark, threshold := m.rotationSettings()
+	start := -1
+	for i, acc := range accounts {
+		if acc.ID == id {
+			start = i
 			break
 		}
 	}
-	if next == nil {
-		next = accounts[0]
+	for offset := 1; offset <= len(accounts); offset++ {
+		acc := accounts[(start+offset)%len(accounts)]
+		if acc.ID == id || time.Now().Before(m.unavailableUntil[acc.ID]) || quotaLow(quotaFromAccount(acc), benchmark, threshold) {
+			continue
+		}
+		if _, err := m.selectAccount(acc.ID); err == nil {
+			return true
+		}
 	}
-
-	_, _ = m.SelectAccount(next.ID)
+	return false
 }
 
 func (m *Manager) WarmupAccount(acc *storage.Account) *WarmupResult {

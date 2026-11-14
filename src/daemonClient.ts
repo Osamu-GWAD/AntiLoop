@@ -10,8 +10,8 @@ export function readPortFile(storagePath: string, fileName: string): number {
   const filePath = path.join(storagePath, fileName);
   try {
     const content = fs.readFileSync(filePath, 'utf8').trim();
-    const port = parseInt(content, 10);
-    return isNaN(port) ? 0 : port;
+    const port = Number(content);
+    return Number.isInteger(port) && port > 0 && port <= 65535 ? port : 0;
   } catch {
     return 0;
   }
@@ -62,6 +62,8 @@ export class DaemonClient {
   private onDeadCallback: (() => void) | null = null;
   public storagePath = '';
   private connectPromise: Promise<void> | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private connectionGeneration = 0;
   private outputChannel: vscode.OutputChannel;
 
   constructor(extensionPath: string, outputChannel: vscode.OutputChannel) {
@@ -110,34 +112,34 @@ export class DaemonClient {
   }
 
   public async connect(storagePath: string): Promise<void> {
-    if (this.socket) {
-      this.log('Already connected to daemon');
-      return;
-    }
+    if (this.disposed) throw new Error('Daemon client is disposed');
     if (this.connectPromise) {
       return this.connectPromise;
     }
-    this.connectPromise = this.doConnect(storagePath).catch((err) => {
-      this.connectPromise = null;
-      throw err;
+    if (this.isRunning) return;
+    this.intentionalStop = false;
+    this.cancelReconnect();
+    const generation = this.connectionGeneration;
+    const pending = this.doConnect(storagePath, generation).finally(() => {
+      if (this.connectPromise === pending) this.connectPromise = null;
     });
-    return this.connectPromise;
+    this.connectPromise = pending;
+    return pending;
   }
 
-  private async doConnect(storagePath: string): Promise<void> {
+  private async doConnect(storagePath: string, generation: number): Promise<void> {
     this.storagePath = storagePath;
     const existingPort = readDaemonPort(storagePath);
     if (existingPort > 0) {
       const opts = { port: existingPort, host: '127.0.0.1' };
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          this.socket = await this.tryConnect(opts);
+          const socket = await this.tryConnect(opts);
+          this.attachSocket(socket, generation);
           this.log(`Connected to existing daemon at 127.0.0.1:${existingPort} (attempt ${attempt + 1})`);
-          this.setupSocketHandlers();
-          this.crashCount = 0;
-          this.intentionalStop = false;
           return;
         } catch {
+          this.checkConnectionGeneration(generation);
           if (attempt < 1) {
             this.log(`Connect attempt ${attempt + 1} to port ${existingPort} failed, retrying...`);
             await new Promise((r) => setTimeout(r, 200));
@@ -148,12 +150,30 @@ export class DaemonClient {
     }
 
     this.log('No existing daemon found, spawning fresh...');
+    this.checkConnectionGeneration(generation);
     this.spawnDaemon(storagePath);
-    this.socket = await this.waitForDaemon(storagePath, 50, 200);
+    const socket = await this.waitForDaemon(storagePath, 50, 200, generation);
+    this.attachSocket(socket, generation);
     this.log('Connected to new daemon');
-    this.setupSocketHandlers();
+  }
+
+  private checkConnectionGeneration(generation: number) {
+    if (this.disposed || generation !== this.connectionGeneration) {
+      throw new Error('Daemon connection cancelled');
+    }
+  }
+
+  private attachSocket(socket: net.Socket, generation: number) {
+    try {
+      this.checkConnectionGeneration(generation);
+    } catch (err) {
+      socket.destroy();
+      throw err;
+    }
+    this.buffer = '';
+    this.socket = socket;
+    this.setupSocketHandlers(socket);
     this.crashCount = 0;
-    this.intentionalStop = false;
   }
 
   private tryConnect(opts: { port: number; host: string }): Promise<net.Socket> {
@@ -175,8 +195,9 @@ export class DaemonClient {
     });
   }
 
-  private async waitForDaemon(storagePath: string, retries: number, delayMs: number): Promise<net.Socket> {
+  private async waitForDaemon(storagePath: string, retries: number, delayMs: number, generation: number): Promise<net.Socket> {
     for (let i = 0; i < retries; i++) {
+      this.checkConnectionGeneration(generation);
       const port = readDaemonPort(storagePath);
       if (port > 0) {
         try {
@@ -216,62 +237,65 @@ export class DaemonClient {
     });
   }
 
-  private setupSocketHandlers() {
-    if (!this.socket) return;
-
-    this.socket.on('data', (chunk: Buffer) => {
-      this.handleData(chunk.toString('utf8'));
+  private setupSocketHandlers(socket: net.Socket) {
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk: string) => {
+      if (this.socket === socket) this.handleData(chunk);
     });
 
-    this.socket.on('close', () => {
+    socket.on('close', () => {
+      if (this.socket !== socket) return;
       this.log('Daemon connection closed');
       this.socket = null;
-      this.connectPromise = null;
+      this.buffer = '';
+      this.rejectPending(new Error('Daemon connection closed'));
 
       if (this.intentionalStop) {
-        this.intentionalStop = false;
-        for (const [, req] of this.pendingRequests) {
-          clearTimeout(req.timer);
-        }
-        this.pendingRequests.clear();
-        this.log('Intentional stop — skipping auto-reconnect');
+        this.log('Intentional stop, skipping auto-reconnect');
         return;
       }
-
-      for (const [, req] of this.pendingRequests) {
-        clearTimeout(req.timer);
-        req.reject(new Error('Daemon connection closed'));
-      }
-      this.pendingRequests.clear();
-
-      if (this.disposed) return;
-
-      this.crashCount++;
-      if (this.crashCount <= this.maxCrashRestarts) {
-        const delay = this.restartDelays[this.crashCount - 1] || 10000;
-        this.log(`Disconnect #${this.crashCount}/${this.maxCrashRestarts}, reconnecting in ${delay}ms...`);
-        setTimeout(async () => {
-          if (this.disposed) return;
-          try {
-            await this.connect(this.storagePath);
-            this.log('Reconnected successfully');
-            this.onReadyCallback?.();
-          } catch {
-            this.log('Reconnect failed');
-            if (this.crashCount >= this.maxCrashRestarts) {
-              this.onDeadCallback?.();
-            }
-          }
-        }, delay);
-      } else {
-        this.log(`Max reconnect attempts (${this.maxCrashRestarts}) exceeded`);
-        this.onDeadCallback?.();
-      }
+      this.scheduleReconnect();
     });
 
-    this.socket.on('error', (err) => {
+    socket.on('error', (err) => {
       this.log(`Socket error: ${err.message}`);
     });
+  }
+
+  private rejectPending(error: Error) {
+    for (const req of this.pendingRequests.values()) {
+      clearTimeout(req.timer);
+      req.reject(error);
+    }
+    this.pendingRequests.clear();
+  }
+
+  private cancelReconnect() {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
+  private scheduleReconnect() {
+    if (this.disposed || this.intentionalStop || this.reconnectTimer) return;
+    if (this.crashCount >= this.maxCrashRestarts) {
+      this.log(`Max reconnect attempts (${this.maxCrashRestarts}) exceeded`);
+      this.onDeadCallback?.();
+      return;
+    }
+    const delay = this.restartDelays[this.crashCount++] || 10000;
+    this.log(`Reconnect attempt ${this.crashCount}/${this.maxCrashRestarts} in ${delay}ms...`);
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      if (this.disposed || this.intentionalStop) return;
+      try {
+        await this.connect(this.storagePath);
+        this.log('Reconnected successfully');
+        this.onReadyCallback?.();
+      } catch {
+        this.log('Reconnect failed');
+        this.scheduleReconnect();
+      }
+    }, delay);
   }
 
   private handleData(incoming: string) {
@@ -328,27 +352,57 @@ export class DaemonClient {
         method,
         params,
       };
-      this.socket!.write(JSON.stringify(req) + '\n');
+      const fail = (err: Error) => {
+        clearTimeout(timer);
+        this.pendingRequests.delete(id);
+        reject(err);
+      };
+      try {
+        this.socket!.write(JSON.stringify(req) + '\n', (err) => {
+          if (err) fail(err);
+        });
+      } catch (err) {
+        fail(err as Error);
+      }
       this.log(`→ ${method} (id=${id})`);
     });
   }
 
   public async stop(): Promise<void> {
-    if (this.socket) {
-      this.intentionalStop = true;
+    this.intentionalStop = true;
+    this.connectionGeneration++;
+    this.cancelReconnect();
+    this.connectPromise = null;
+    const socket = this.socket;
+    if (socket) {
       try {
         await this.send('shutdown', undefined, 3000);
       } catch {}
-      if (this.socket) {
-        this.socket.destroy();
-        this.socket = null;
+      if (!socket.destroyed) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            socket.destroy();
+            resolve();
+          }, 1000);
+          socket.once('close', () => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
       }
-      this.connectPromise = null;
     }
+    if (this.socket === socket) this.socket = null;
+    this.buffer = '';
+    this.rejectPending(new Error('Daemon stopped'));
   }
 
   public dispose() {
     this.disposed = true;
+    this.connectionGeneration++;
+    this.cancelReconnect();
+    this.connectPromise = null;
+    this.rejectPending(new Error('Daemon client disposed'));
+    this.buffer = '';
     if (this.socket) {
       this.socket.destroy();
       this.socket = null;

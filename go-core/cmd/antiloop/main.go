@@ -40,7 +40,7 @@ func main() {
 	defer fileLock.Unlock()
 
 	logFile := filepath.Join(storagePath, "daemon.log")
-	_ = applog.Init(logFile, true)
+	_ = applog.Init(logFile, false)
 
 	applog.Printf("[main] starting AntiLoop Go backend in %s", storagePath)
 
@@ -111,6 +111,9 @@ func main() {
 
 	rpcCtx.SetOnBrowserURL(func(url string) {
 		daemonIPC.Notify("openBrowser", map[string]string{"url": url})
+	})
+	rpcCtx.SetOnStateChanged(func(method string) {
+		daemonIPC.Notify("stateChanged", map[string]string{"trigger": method})
 	})
 
 	rpc.RegisterHandlers(daemonIPC, rpcCtx)

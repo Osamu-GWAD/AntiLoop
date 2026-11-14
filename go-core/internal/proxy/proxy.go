@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -87,6 +88,9 @@ func (s *Server) SetMaxRetries(n int) {
 	defer s.mu.Unlock()
 	if n <= 0 {
 		n = 1
+	}
+	if n > 10 {
+		n = 10
 	}
 	s.maxRetries = n
 }
@@ -250,11 +254,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := s.rotation.GetActiveAccessToken()
+	acc, token, err := s.rotation.GetActiveAccountToken()
+	if err != nil && acc != nil && s.rotation.RotateIfCurrent(acc.ID, false) {
+		acc, token, err = s.rotation.GetActiveAccountToken()
+	}
 	isPassThrough := false
 	if err != nil || token == "" {
 		incomingAuth := r.Header.Get("Authorization")
-		if incomingAuth != "" {
+		if incomingAuth != "" && errors.Is(err, rotation.ErrNoActiveAccount) {
 			token = strings.TrimPrefix(incomingAuth, "Bearer ")
 			token = strings.TrimPrefix(token, "bearer ")
 			token = strings.TrimSpace(token)
@@ -271,15 +278,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		token = strings.TrimSpace(token)
 	}
 
-	email := s.rotation.CurrentEmail()
-	if email == "" && isPassThrough {
-		email = "ide-passthrough"
+	email := "ide-passthrough"
+	if acc != nil {
+		email = acc.Email
 	}
-	applog.Printf("[proxy] → %s %s  account=%s", r.Method, path, email)
-
-	if !isPassThrough && s.rotation.CurrentUseAICredits() {
-		bodyBytes = s.rewriteAICredits(bodyBytes)
-	}
+	originalBody := bodyBytes
+	applog.Printf("[proxy] → %s %s account=%s", r.Method, path, email)
 
 	baseUpstream := s.getBaseUpstreamURL()
 	upstreamURL := baseUpstream + r.URL.RequestURI()
@@ -287,9 +291,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var resp *http.Response
 	var clientErr error
-	maxRetries := s.maxRetries
+	s.mu.RLock()
+	maxRetries, onRetry := s.maxRetries, s.onRetryEvent
+	s.mu.RUnlock()
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
+		bodyBytes = originalBody
+		if !isPassThrough {
+			bodyBytes = rewriteAccountBody(originalBody, acc)
+		}
 		req, reqErr := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(bodyBytes))
 		if reqErr != nil {
 			http.Error(w, reqErr.Error(), http.StatusInternalServerError)
@@ -315,32 +325,38 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		resp, clientErr = s.client.Do(req)
+		shouldRetry := clientErr != nil
 		if clientErr == nil {
-			if resp.StatusCode == http.StatusTooManyRequests {
-				applog.Printf("[proxy] upstream HTTP 429 Too Many Requests (attempt %d/%d) — triggering account rotation", attempt, maxRetries)
-				s.rotation.RotateToNextAccount()
-				if !isPassThrough {
-					if nextTok, tokErr := s.rotation.GetActiveAccessToken(); tokErr == nil && nextTok != "" {
-						token = strings.TrimSpace(strings.TrimPrefix(nextTok, "Bearer "))
+			shouldRetry = resp.StatusCode >= 500
+			if resp.StatusCode == http.StatusTooManyRequests && !isPassThrough {
+				if s.rotation.RotateIfCurrent(acc.ID, true) && attempt < maxRetries {
+					nextAcc, nextToken, tokenErr := s.rotation.GetActiveAccountToken()
+					if tokenErr == nil && nextAcc.ID != acc.ID {
+						acc, token, email = nextAcc, nextToken, nextAcc.Email
+						shouldRetry = true
 					}
 				}
-			} else if resp.StatusCode < 500 {
-				break
 			}
 		}
-
+		if !shouldRetry || attempt == maxRetries {
+			break
+		}
 		if resp != nil {
 			resp.Body.Close()
+			resp = nil
+		}
+		delayMs := 500 * (1 << (attempt - 1))
+		if onRetry != nil {
+			onRetry(attempt, maxRetries, delayMs)
+		}
+		timer := time.NewTimer(time.Duration(delayMs) * time.Millisecond)
+		select {
+		case <-r.Context().Done():
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
 
-		if attempt < maxRetries {
-			delayMs := 500 * (1 << (attempt - 1))
-			applog.Printf("[proxy] request failed (attempt %d/%d), retrying in %dms...", attempt, maxRetries, delayMs)
-			if s.onRetryEvent != nil {
-				s.onRetryEvent(attempt, maxRetries, delayMs)
-			}
-			time.Sleep(time.Duration(delayMs) * time.Millisecond)
-		}
 	}
 
 	if clientErr != nil || resp == nil {
@@ -412,20 +428,27 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	applog.Printf("[proxy] ← %s %s  status=%d  duration=%s", r.Method, path, resp.StatusCode, duration)
 }
 
-func (s *Server) rewriteAICredits(body []byte) []byte {
-	if len(body) == 0 {
+func rewriteAccountBody(body []byte, acc *storage.Account) []byte {
+	if acc == nil || len(body) == 0 {
 		return body
 	}
-	var m map[string]any
-	if err := json.Unmarshal(body, &m); err != nil {
+	var data map[string]any
+	if json.Unmarshal(body, &data) != nil || data == nil {
 		return body
 	}
-	m["useAiCredits"] = true
-	res, err := json.Marshal(m)
+	if acc.ProjectID != "" {
+		data["project"] = acc.ProjectID
+	} else {
+		delete(data, "project")
+	}
+	if _, exists := data["useAiCredits"]; exists || acc.UseAICredits {
+		data["useAiCredits"] = acc.UseAICredits
+	}
+	result, err := json.Marshal(data)
 	if err != nil {
 		return body
 	}
-	return res
+	return result
 }
 
 func (s *Server) Close() error {

@@ -81,6 +81,7 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'antiLoop.accounts';
   private view?: vscode.WebviewView;
   private isWebviewReady = false;
+  private stateRequest = 0;
   public isDev = false;
   public ideVersion = '';
   public pluginVersion = '';
@@ -103,6 +104,8 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
     _token: vscode.CancellationToken
   ) {
     this.view = webviewView;
+    this.isWebviewReady = false;
+    this.stateRequest++;
     this.log('[sidebar] resolveWebviewView called');
 
     webviewView.webview.options = {
@@ -157,7 +160,8 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
           return;
         }
 
-        const result = await this.sendRpc(msg.method, msg.params);
+        const timeout = msg.method === 'addAccount' || msg.method === 'warmupAccounts' ? 300000 : undefined;
+        const result = await this.sendRpc(msg.method, msg.params, timeout);
         webviewView.webview.postMessage({ type: 'response', id: msg.id, result });
 
         if (MUTATION_METHODS.has(msg.method)) {
@@ -192,6 +196,7 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
 
   public async pushFullState() {
     if (!this.view) return;
+    const request = ++this.stateRequest;
     try {
       const [status, accountsData, providersData] = await Promise.all([
         this.sendRpc('getStatus').catch(() => null),
@@ -199,6 +204,7 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
         this.sendRpc('listProviders').catch(() => null),
       ]);
 
+      if (request !== this.stateRequest || !status || !accountsData || !providersData) return;
       this.view.webview.postMessage({
         type: 'state',
         data: {

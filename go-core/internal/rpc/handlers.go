@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strconv"
 	"sync"
@@ -32,10 +33,30 @@ type Context struct {
 
 	addAccountCancel context.CancelFunc
 	addAccountMu     sync.Mutex
+	selectionMu      sync.Mutex
 	onBrowserURL     func(url string)
+	onStateChanged   func(method string)
 }
 
+type notifyingRegistrar struct {
+	HandlerRegistrar
+	ctx *Context
+}
+
+func (r notifyingRegistrar) RegisterMutation(method string, fn func(json.RawMessage) (any, error)) {
+	r.HandlerRegistrar.RegisterMutation(method, func(params json.RawMessage) (any, error) {
+		result, err := fn(params)
+		if err == nil && r.ctx.onStateChanged != nil {
+			r.ctx.onStateChanged(method)
+		}
+		return result, err
+	})
+}
+
+func (ctx *Context) SetOnStateChanged(fn func(string)) { ctx.onStateChanged = fn }
+
 func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
+	reg = notifyingRegistrar{HandlerRegistrar: reg, ctx: ctx}
 
 	reg.RegisterHandler("activate", func(params json.RawMessage) (any, error) {
 		var p struct {
@@ -92,7 +113,7 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 		}
 		type AccountWithQuota struct {
 			*storage.Account
-			Quota  *rotation.QuotaData   `json:"quota,omitempty"`
+			Quota  *rotation.QuotaData  `json:"quota,omitempty"`
 			Models []rotation.ModelItem `json:"models,omitempty"`
 		}
 		var result []AccountWithQuota
@@ -349,24 +370,30 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 			ID    int64  `json:"id"`
 			Email string `json:"email"`
 		}
-		_ = json.Unmarshal(params, &p)
-
-		// When selecting a Google account, deactivate any active external provider.
-		_ = ctx.DB.SetSetting("active_provider_id", "0")
-		ctx.Proxy.UpstreamRouter().SetActiveProvider(nil)
-
-		var acc *storage.Account
-		var err error
-		if p.ID > 0 {
-			acc, err = ctx.Rotation.SelectAccount(p.ID)
-		} else if p.Email != "" {
-			if a, e := ctx.DB.GetAccountByEmail(p.Email); e == nil {
-				acc, err = ctx.Rotation.SelectAccount(a.ID)
-			}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
 		}
+		ctx.selectionMu.Lock()
+		defer ctx.selectionMu.Unlock()
+		if p.ID <= 0 {
+			if p.Email == "" {
+				return nil, fmt.Errorf("account ID or email is required")
+			}
+			a, err := ctx.DB.GetAccountByEmail(p.Email)
+			if err != nil {
+				return nil, err
+			}
+			p.ID = a.ID
+		}
+		acc, err := ctx.Rotation.SelectAccount(p.ID)
 		if err != nil {
 			return nil, err
 		}
+		if err := ctx.DB.SetSetting("active_provider_id", "0"); err != nil {
+			return nil, err
+		}
+		ctx.Proxy.UpstreamRouter().SetActiveProvider(nil)
+
 		return map[string]any{
 			"currentEmail": acc.Email,
 			"currentTier":  acc.Tier,
@@ -385,6 +412,9 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 			status = "excluded"
 		}
 		err := ctx.DB.UpdateAccountStatus(p.ID, status)
+		if err == nil {
+			ctx.Rotation.EnsureActiveAccount()
+		}
 		return map[string]bool{"ok": err == nil}, err
 	})
 
@@ -424,11 +454,13 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 		}
 		_ = json.Unmarshal(params, &p)
 		err := ctx.DB.RemoveAccount(p.ID)
-		ctx.Rotation.EnsureActiveAccount()
+		if err == nil {
+			ctx.Rotation.EnsureActiveAccount()
+		}
 		return map[string]bool{"ok": err == nil}, err
 	})
 
-	reg.RegisterMutation("refreshAccount", func(params json.RawMessage) (any, error) {
+	reg.RegisterHandler("refreshAccount", func(params json.RawMessage) (any, error) {
 		var p struct {
 			ID int64 `json:"id"`
 		}
@@ -443,11 +475,20 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 
 	reg.RegisterHandler("addAccount", func(params json.RawMessage) (any, error) {
 		ctx.addAccountMu.Lock()
+		if ctx.addAccountCancel != nil {
+			ctx.addAccountMu.Unlock()
+			return nil, fmt.Errorf("an account login is already in progress")
+		}
 		cCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		ctx.addAccountCancel = cancel
 		ctx.addAccountMu.Unlock()
 
-		defer cancel()
+		defer func() {
+			cancel()
+			ctx.addAccountMu.Lock()
+			ctx.addAccountCancel = nil
+			ctx.addAccountMu.Unlock()
+		}()
 
 		applog.Println("[rpc] starting OAuth flow for addAccount")
 		res, err := oauth.StartAuthFlow(cCtx, func(authUrl string) {
@@ -477,7 +518,6 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 		ctx.addAccountMu.Lock()
 		if ctx.addAccountCancel != nil {
 			ctx.addAccountCancel()
-			ctx.addAccountCancel = nil
 		}
 		ctx.addAccountMu.Unlock()
 		return map[string]bool{"ok": true}, nil
@@ -500,10 +540,16 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 
 		existing, _ := ctx.DB.GetAccountByEmail(p.Email)
 		if existing != nil {
-
+			if existing.AccessToken == p.AccessToken && existing.RefreshToken == p.RefreshToken {
+				return map[string]bool{"imported": false}, nil
+			}
 			expStr := time.Unix(p.ExpiryDateSeconds, 0).UTC().Format(time.RFC3339)
-			_ = ctx.DB.UpdateAccountToken(existing.ID, p.AccessToken, expStr)
-			ctx.Rotation.EnsureActiveAccount()
+			if err := ctx.DB.UpdateAccountCredentials(existing.ID, p.AccessToken, p.RefreshToken, expStr); err != nil {
+				return nil, err
+			}
+			if ctx.Rotation.CurrentAccountID() != existing.ID {
+				ctx.Rotation.EnsureActiveAccount()
+			}
 			return map[string]bool{"imported": false}, nil
 		}
 
@@ -621,6 +667,8 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 	})
 
 	reg.RegisterMutation("updateProvider", func(params json.RawMessage) (any, error) {
+		ctx.selectionMu.Lock()
+		defer ctx.selectionMu.Unlock()
 		var p struct {
 			ID                    int64  `json:"id"`
 			Name                  string `json:"name"`
@@ -684,6 +732,8 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 	})
 
 	reg.RegisterMutation("removeProvider", func(params json.RawMessage) (any, error) {
+		ctx.selectionMu.Lock()
+		defer ctx.selectionMu.Unlock()
 		var p struct {
 			ID int64 `json:"id"`
 		}
@@ -699,6 +749,8 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 	})
 
 	reg.RegisterMutation("toggleProviderEnabled", func(params json.RawMessage) (any, error) {
+		ctx.selectionMu.Lock()
+		defer ctx.selectionMu.Unlock()
 		var p struct {
 			ID      int64 `json:"id"`
 			Enabled bool  `json:"enabled"`
@@ -716,6 +768,8 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 	})
 
 	reg.RegisterMutation("selectProvider", func(params json.RawMessage) (any, error) {
+		ctx.selectionMu.Lock()
+		defer ctx.selectionMu.Unlock()
 		var p struct {
 			ID      *int64 `json:"id"`
 			Enabled *bool  `json:"enabled"`

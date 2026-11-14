@@ -96,6 +96,7 @@
     }
   },
   "scripts": {
+    "test": "node --test tests",
     "vscode:uninstall": "node ./out/uninstall.js",
     "build:go": "bash scripts/build-go.sh",
     "typecheck": "tsc --noEmit --skipLibCheck",

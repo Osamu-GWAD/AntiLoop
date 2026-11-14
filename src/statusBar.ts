@@ -97,6 +97,11 @@ export class StatusBarManager {
     tier: string,
     source: string
   ) {
+    if (email !== this.lastEmail) {
+      this.cachedQuota = null;
+      this.cachedQuotaEmail = '';
+      this.hideQuota();
+    }
     this.lastState = state;
     this.lastEmail = email;
     this.lastTier = tier;
@@ -194,8 +199,11 @@ export class StatusBarManager {
   }
 
   public handleQuotaUpdate(quota: QuotaData, email?: string) {
+    if (email && email !== this.lastEmail) return;
     this.cachedQuota = quota;
     this.cachedQuotaEmail = email || this.lastEmail;
+
+    if (this.activeProviderName) return;
 
     if (!this.quotaSettings.display) {
       this.hideQuota();
