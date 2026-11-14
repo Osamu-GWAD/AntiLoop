@@ -58,7 +58,10 @@ export async function activate(context: vscode.ExtensionContext) {
     () => state.isBackendReady,
     async (method, params, timeoutMs) => {
       const result = await daemonClient!.send(method, params, timeoutMs);
-      if (method === 'selectAccount') await waitForIdeTokenUpdate();
+      if (method === 'selectAccount') {
+        await waitForIdeTokenUpdate();
+        await syncAuthWithIde();
+      }
       return result;
     },
     (webview) => getWebviewHtml(webview, context.extensionUri),
@@ -213,6 +216,7 @@ export async function activate(context: vscode.ExtensionContext) {
               refreshToken: params.refreshToken,
               expiryDateSeconds: params.expiryDateSeconds,
             });
+            await syncAuthWithIde();
           } catch (err: any) {
             log(`[injectToken] IDE account update failed: ${err.message}`);
           }
@@ -380,6 +384,12 @@ export async function activate(context: vscode.ExtensionContext) {
           },
         });
       } catch {}
+      try {
+        await vscode.commands.executeCommand('antigravity.internal.getAuthStatus');
+      } catch {}
+      try {
+        await vscode.commands.executeCommand('antigravity.getUserSettings');
+      } catch {}
       accountsProvider?.refreshState();
     })
   );
@@ -493,6 +503,9 @@ async function activateDaemon(
 
   await applyProxyUrl(res.proxyEnabled, res.proxyPort);
   await daemonClient?.send('pushCurrentToken', {}).catch(() => {});
+  await syncAuthWithIde();
+  setTimeout(() => { syncAuthWithIde(); }, 1500);
+  setTimeout(() => { syncAuthWithIde(); }, 3500);
 
   if (res.autoEnabled) {
     state.isEnabled = true;
@@ -613,6 +626,9 @@ async function handleSetProxyEnabled(params: { enabled: boolean }) {
 
   await applyProxyUrl(res.proxyEnabled, res.proxyPort);
   await daemonClient?.send('pushCurrentToken', {}).catch(() => {});
+  await syncAuthWithIde();
+  setTimeout(() => { syncAuthWithIde(); }, 1500);
+  setTimeout(() => { syncAuthWithIde(); }, 3500);
   const reload = 'Reload Now';
   const chosen = await vscode.window.showInformationMessage(
     'Proxy setting updated. Reload Window to fully apply.',
@@ -740,7 +756,10 @@ function openAdminPanelWebview(context: vscode.ExtensionContext) {
       }
       const timeout = msg.method === 'addAccount' || msg.method === 'warmupAccounts' ? 300000 : undefined;
       const res = await daemonClient!.send(msg.method, msg.params, timeout);
-      if (msg.method === 'selectAccount') await waitForIdeTokenUpdate();
+      if (msg.method === 'selectAccount') {
+        await waitForIdeTokenUpdate();
+        await syncAuthWithIde();
+      }
       adminPanelWebview?.webview.postMessage({ type: 'response', id: msg.id, result: res });
       accountsProvider?.refreshState();
     } catch (err: any) {
@@ -751,6 +770,50 @@ function openAdminPanelWebview(context: vscode.ExtensionContext) {
   adminPanelWebview.onDidDispose(() => {
     adminPanelWebview = undefined;
   });
+}
+
+export async function syncAuthWithIde() {
+  log('[syncAuthWithIde] Triggering IDE auth & settings sync');
+  try {
+    const sync = (vscode as any).antigravityUnifiedStateSync;
+    await sync?.pushUpdate?.({
+      topicName: 'uss-oauth',
+      appliedUpdate: {
+        key: 'authStateWithContextSentinelKey',
+        newRow: {
+          value: JSON.stringify({
+            state: 'signedIn',
+            context: {
+              project: '',
+              showProjectError: false,
+              errorMessage: '',
+              ineligibleMessage: '',
+              verificationUrl: '',
+              isGcpTos: false,
+              browserOpenFailed: false,
+              appealUrl: '',
+              appealLinkText: '',
+            },
+          }),
+          eTag: 0,
+        },
+      },
+    });
+  } catch (err: any) {
+    log(`[syncAuthWithIde] uss-oauth update error: ${err.message}`);
+  }
+  try {
+    await vscode.commands.executeCommand('antigravity.internal.getAuthStatus');
+    log('[syncAuthWithIde] antigravity.internal.getAuthStatus executed successfully');
+  } catch (err: any) {
+    log(`[syncAuthWithIde] antigravity.internal.getAuthStatus error: ${err.message}`);
+  }
+  try {
+    await vscode.commands.executeCommand('antigravity.getUserSettings');
+    log('[syncAuthWithIde] antigravity.getUserSettings executed successfully');
+  } catch (err: any) {
+    log(`[syncAuthWithIde] antigravity.getUserSettings error: ${err.message}`);
+  }
 }
 
 export async function deactivate() {

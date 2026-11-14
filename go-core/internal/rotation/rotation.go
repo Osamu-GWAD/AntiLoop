@@ -401,19 +401,20 @@ func (m *Manager) emitStatus() {
 }
 
 func (m *Manager) PushCurrentToken() {
-	acc, _, err := m.GetActiveAccountToken()
-	if err != nil {
+	acc, token, err := m.GetActiveAccountToken()
+	if err != nil || acc == nil {
 		return
 	}
 	m.switchMu.Lock()
 	defer m.switchMu.Unlock()
-	m.mu.RLock()
-	current := m.currentAccount
-	matches := current != nil && current.ID == acc.ID && current.AccessToken == acc.AccessToken
-	m.mu.RUnlock()
-	if matches {
-		m.pushToken(acc)
+	if token != "" {
+		acc.AccessToken = token
 	}
+	m.mu.Lock()
+	current := *acc
+	m.currentAccount = &current
+	m.mu.Unlock()
+	m.pushToken(acc)
 }
 
 func (m *Manager) PushCurrentQuota() {

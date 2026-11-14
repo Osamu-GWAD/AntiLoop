@@ -42,17 +42,151 @@ export function waitForIdeTokenUpdate(): Promise<void> {
   return tokenWrite;
 }
 
-export function encodeUserStatus(email: string, name?: string): string {
+function stripFieldFromProto(buf: Buffer, fieldToDrop: number): Buffer {
+  const parts: Buffer[] = [];
+  let i = 0;
+  while (i < buf.length) {
+    const start = i;
+    let key = 0;
+    let shift = 0;
+    while (i < buf.length) {
+      const b = buf[i++];
+      key |= (b & 0x7f) << shift;
+      if ((b & 0x80) === 0) break;
+      shift += 7;
+    }
+    const fieldNum = key >> 3;
+    const wireType = key & 0x7;
+    if (wireType === 0) {
+      while (i < buf.length) {
+        const b = buf[i++];
+        if ((b & 0x80) === 0) break;
+      }
+    } else if (wireType === 2) {
+      let len = 0;
+      shift = 0;
+      while (i < buf.length) {
+        const b = buf[i++];
+        len |= (b & 0x7f) << shift;
+        if ((b & 0x80) === 0) break;
+        shift += 7;
+      }
+      i += len;
+    } else if (wireType === 1) {
+      i += 8;
+    } else if (wireType === 5) {
+      i += 4;
+    } else {
+      break;
+    }
+    if (fieldNum !== fieldToDrop) {
+      parts.push(buf.subarray(start, i));
+    }
+  }
+  return Buffer.concat(parts);
+}
+
+function encodeVarint(val: number): Buffer {
+  const bytes: number[] = [];
+  let v = val;
+  while (v >= 0x80) {
+    bytes.push((v & 0x7f) | 0x80);
+    v >>>= 7;
+  }
+  bytes.push(v & 0x7f);
+  return Buffer.from(bytes);
+}
+
+function encodeLengthDelimited(fieldNum: number, payload: Buffer): Buffer {
+  const tag = encodeVarint((fieldNum << 3) | 2);
+  const len = encodeVarint(payload.length);
+  return Buffer.concat([tag, len, payload]);
+}
+
+export function encodeUserStatus(email: string, name?: string, existingBase64?: string): string {
+  const userName = name || email.split('@')[0];
+  const nameBuf = Buffer.from(userName, 'utf8');
+  const emailBuf = Buffer.from(email, 'utf8');
+
+  // If existing protobuf data is provided, preserve fields (especially field 33 cascadeModelConfigData, field 8 userTier)
+  if (existingBase64) {
+    try {
+      const raw = Buffer.from(existingBase64, 'base64');
+      const preservedChunks: Buffer[] = [];
+      let i = 0;
+      while (i < raw.length) {
+        const start = i;
+        let key = 0;
+        let shift = 0;
+        while (i < raw.length) {
+          const b = raw[i++];
+          key |= (b & 0x7f) << shift;
+          if ((b & 0x80) === 0) break;
+          shift += 7;
+        }
+        const fieldNum = key >> 3;
+        const wireType = key & 0x7;
+        let subLen = 0;
+        if (wireType === 0) {
+          while (i < raw.length) {
+            const b = raw[i++];
+            if ((b & 0x80) === 0) break;
+          }
+        } else if (wireType === 2) {
+          shift = 0;
+          while (i < raw.length) {
+            const b = raw[i++];
+            subLen |= (b & 0x7f) << shift;
+            if ((b & 0x80) === 0) break;
+            shift += 7;
+          }
+          i += subLen;
+        } else if (wireType === 1) {
+          i += 8;
+        } else if (wireType === 5) {
+          i += 4;
+        } else {
+          break;
+        }
+
+        // Keep all fields EXCEPT field 1 (pro), field 3 (name), and field 7 (email) which we overwrite
+        if (fieldNum !== 1 && fieldNum !== 3 && fieldNum !== 7) {
+          if (fieldNum === 33 && wireType === 2) {
+            try {
+              // Strip field 6 (errorMessage) from cascadeModelConfigData so stale error banners are never preserved
+              const payload = raw.subarray(i - subLen, i);
+              const cleaned = stripFieldFromProto(payload, 6);
+              if (cleaned.length > 0) {
+                preservedChunks.push(encodeLengthDelimited(33, cleaned));
+              }
+            } catch {
+              preservedChunks.push(raw.subarray(start, i));
+            }
+          } else {
+            preservedChunks.push(raw.subarray(start, i));
+          }
+        }
+      }
+
+      const parts: Buffer[] = [
+        Buffer.from([0x08, 0x01]),
+        ...preservedChunks,
+        Buffer.from([0x1a, nameBuf.length]),
+        nameBuf,
+        Buffer.from([0x3a, emailBuf.length]),
+        emailBuf,
+      ];
+      return Buffer.concat(parts).toString('base64');
+    } catch {}
+  }
+
   const parts: Buffer[] = [];
   // Field 1: pro (bool = true) -> tag (1 << 3) | 0 = 0x08, value 0x01
   parts.push(Buffer.from([0x08, 0x01]));
 
-  const userName = name || email.split('@')[0];
-  const nameBuf = Buffer.from(userName, 'utf8');
   // Field 3: name (string) -> tag (3 << 3) | 2 = 0x1a, length varint
   parts.push(Buffer.from([0x1a, nameBuf.length]), nameBuf);
 
-  const emailBuf = Buffer.from(email, 'utf8');
   // Field 7: email (string) -> tag (7 << 3) | 2 = 0x3a, length varint
   parts.push(Buffer.from([0x3a, emailBuf.length]), emailBuf);
 
@@ -105,15 +239,23 @@ export function setIdeToken(tokenInfo: ActiveIdeToken): Promise<void> {
       console.error(`[tokenHelper] Failed to update authStateWithContext: ${err.message}`);
     }
 
-    // 3. Update UserStatus with active user email & name (without wiping status)
+    // 3. Update UserStatus with active user email & name (preserving existing model config data)
     if (next.email) {
       try {
+        let existingBase64: string | undefined;
+        try {
+          const raw = await sync.UserStatus?.getUserStatus?.();
+          if (typeof raw === 'string' && raw.length > 0) {
+            existingBase64 = raw;
+          }
+        } catch {}
+
         await sync.pushUpdate?.({
           topicName: 'uss-userStatus',
           appliedUpdate: {
             key: 'userStatusSentinelKey',
             newRow: {
-              value: encodeUserStatus(next.email),
+              value: encodeUserStatus(next.email, undefined, existingBase64),
               eTag: 0,
             },
           },
