@@ -210,62 +210,63 @@ export function setIdeToken(tokenInfo: ActiveIdeToken): Promise<void> {
       tokenType: 'Bearer',
     });
 
-    // 2. Ensure auth state in uss-oauth is marked as signedIn
-    try {
-      await sync.pushUpdate?.({
-        topicName: 'uss-oauth',
-        appliedUpdate: {
-          key: 'authStateWithContextSentinelKey',
-          newRow: {
-            value: JSON.stringify({
-              state: 'signedIn',
-              context: {
-                project: '',
-                showProjectError: false,
-                errorMessage: '',
-                ineligibleMessage: '',
-                verificationUrl: '',
-                isGcpTos: false,
-                browserOpenFailed: false,
-                appealUrl: '',
-                appealLinkText: '',
-              },
-            }),
-            eTag: 0,
-          },
-        },
-      });
-    } catch (err: any) {
-      console.error(`[tokenHelper] Failed to update authStateWithContext: ${err.message}`);
-    }
-
-    // 3. Update UserStatus with active user email & name (preserving existing model config data)
-    if (next.email) {
+    // Optional legacy sync if pushUpdate is exposed
+    if (typeof sync.pushUpdate === 'function') {
       try {
-        let existingBase64: string | undefined;
-        try {
-          const raw = await sync.UserStatus?.getUserStatus?.();
-          if (typeof raw === 'string' && raw.length > 0) {
-            existingBase64 = raw;
-          }
-        } catch {}
-
-        await sync.pushUpdate?.({
-          topicName: 'uss-userStatus',
+        await sync.pushUpdate({
+          topicName: 'uss-oauth',
           appliedUpdate: {
-            key: 'userStatusSentinelKey',
+            key: 'authStateWithContextSentinelKey',
             newRow: {
-              value: encodeUserStatus(next.email, undefined, existingBase64),
+              value: JSON.stringify({
+                state: 'signedIn',
+                context: {
+                  project: '',
+                  showProjectError: false,
+                  errorMessage: '',
+                  ineligibleMessage: '',
+                  verificationUrl: '',
+                  isGcpTos: false,
+                  browserOpenFailed: false,
+                  appealUrl: '',
+                  appealLinkText: '',
+                },
+              }),
               eTag: 0,
             },
           },
         });
       } catch (err: any) {
-        console.error(`[tokenHelper] Failed to update userStatus: ${err.message}`);
+        console.error(`[tokenHelper] Failed to update authStateWithContext: ${err.message}`);
+      }
+
+      if (next.email) {
+        try {
+          let existingBase64: string | undefined;
+          try {
+            const raw = await sync.UserStatus?.getUserStatus?.();
+            if (typeof raw === 'string' && raw.length > 0) {
+              existingBase64 = raw;
+            }
+          } catch {}
+
+          await sync.pushUpdate({
+            topicName: 'uss-userStatus',
+            appliedUpdate: {
+              key: 'userStatusSentinelKey',
+              newRow: {
+                value: encodeUserStatus(next.email, undefined, existingBase64),
+                eTag: 0,
+              },
+            },
+          });
+        } catch (err: any) {
+          console.error(`[tokenHelper] Failed to update userStatus: ${err.message}`);
+        }
       }
     }
 
-    // 4. Sync ~/.gemini/jetski-standalone-oauth-token for CLI/language server fallback
+    // 2. Sync ~/.gemini/jetski-standalone-oauth-token for CLI/language server fallback
     if (next.email && next.accessToken) {
       try {
         const geminiDir = path.join(os.homedir(), '.gemini');

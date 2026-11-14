@@ -461,8 +461,6 @@ async function activateDaemon(
   platform: string,
   isFirstInstall = false
 ) {
-  const initialIdeToken = await getIdeToken();
-  const initialIdeEmail = await getIdeEmail(initialIdeToken);
   let mtime = 0;
   try {
     const binPath = daemonClient!.getBinaryPath();
@@ -526,9 +524,9 @@ async function activateDaemon(
 
   const tryImport = async (attempt: number) => {
     try {
-      const token = initialIdeToken || await getIdeToken();
+      const token = await getIdeToken();
       if (token?.accessToken && token?.refreshToken && !token.refreshToken.startsWith('MOCK_TOKEN_')) {
-        const email = initialIdeEmail || await getIdeEmail(token);
+        const email = await getIdeEmail(token);
         if (email) {
           const importRes = await daemonClient!.send('importIdeAccount', {
             email,
@@ -774,34 +772,6 @@ function openAdminPanelWebview(context: vscode.ExtensionContext) {
 
 export async function syncAuthWithIde() {
   log('[syncAuthWithIde] Triggering IDE auth & settings sync');
-  try {
-    const sync = (vscode as any).antigravityUnifiedStateSync;
-    await sync?.pushUpdate?.({
-      topicName: 'uss-oauth',
-      appliedUpdate: {
-        key: 'authStateWithContextSentinelKey',
-        newRow: {
-          value: JSON.stringify({
-            state: 'signedIn',
-            context: {
-              project: '',
-              showProjectError: false,
-              errorMessage: '',
-              ineligibleMessage: '',
-              verificationUrl: '',
-              isGcpTos: false,
-              browserOpenFailed: false,
-              appealUrl: '',
-              appealLinkText: '',
-            },
-          }),
-          eTag: 0,
-        },
-      },
-    });
-  } catch (err: any) {
-    log(`[syncAuthWithIde] uss-oauth update error: ${err.message}`);
-  }
   try {
     await vscode.commands.executeCommand('antigravity.internal.getAuthStatus');
     log('[syncAuthWithIde] antigravity.internal.getAuthStatus executed successfully');

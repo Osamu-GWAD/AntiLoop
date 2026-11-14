@@ -46,6 +46,7 @@ var ScopesList = []string{
 	"openid",
 	"https://www.googleapis.com/auth/cclog",
 	"https://www.googleapis.com/auth/experimentsandconfigs",
+	"https://www.googleapis.com/auth/aicode",
 }
 
 func Scopes() string {

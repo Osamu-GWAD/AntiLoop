@@ -547,8 +547,10 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 			if err := ctx.DB.UpdateAccountCredentials(existing.ID, p.AccessToken, p.RefreshToken, expStr); err != nil {
 				return nil, err
 			}
-			if ctx.Rotation.CurrentAccountID() != existing.ID {
+			if ctx.Rotation.CurrentAccountID() == 0 {
 				ctx.Rotation.EnsureActiveAccount()
+			} else if ctx.Rotation.CurrentAccountID() == existing.ID {
+				ctx.Rotation.PushCurrentToken()
 			}
 			return map[string]bool{"imported": false}, nil
 		}
@@ -560,7 +562,9 @@ func RegisterHandlers(reg HandlerRegistrar, ctx *Context) {
 		expStr := time.Unix(p.ExpiryDateSeconds, 0).UTC().Format(time.RFC3339)
 		_ = ctx.DB.UpdateAccountToken(acc.ID, p.AccessToken, expStr)
 
-		ctx.Rotation.EnsureActiveAccount()
+		if ctx.Rotation.CurrentAccountID() == 0 {
+			ctx.Rotation.EnsureActiveAccount()
+		}
 		go ctx.Rotation.FetchAndPushQuota(acc.Email)
 		return map[string]bool{"imported": true}, nil
 	})
